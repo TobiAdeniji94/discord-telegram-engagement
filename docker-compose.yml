@@ -6,16 +6,13 @@ services:
     env_file: .env
     volumes:
       - bot-data:/app/data
-    # Healthcheck: if the process dies, Docker restarts it
+    # Healthcheck: verify the bot process is running
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "python -c 'import os; from pathlib import Path; db = Path(os.getenv(\"DB_PATH\", \"/app/data/bot_state.db\")); db = db if db.is_absolute() else Path(\"/app\") / db; raise SystemExit(0 if db.exists() else 1)'",
-        ]
+      test: ["CMD", "pgrep", "-f", "twitter_intel.main"]
       interval: 60s
-      timeout: 5s
+      timeout: 10s
       retries: 3
+      start_period: 30s
 
 volumes:
   bot-data:
