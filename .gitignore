@@ -1,0 +1,18 @@
+# Local environment secrets
+.env
+
+# Local Python runtime artifacts
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Local SQLite and session artifacts
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Local secret scanning outputs
+gitleaks-report.json
+

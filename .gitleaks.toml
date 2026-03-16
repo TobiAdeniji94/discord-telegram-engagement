@@ -1,0 +1,11 @@
+title = "discord-telegram-engagement gitleaks config"
+
+[allowlist]
+description = "Public X GraphQL bearer token used by official web client flows"
+paths = [
+  '''bot_legacy.py''',
+  '''src/twitter_intel/infrastructure/twitter/x_poster.py''',
+]
+regexes = [
+  '''AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA''',
+]

@@ -1,0 +1,5 @@
+twscrape==0.17.0
+google-generativeai>=0.8
+httpx>=0.27
+python-dotenv>=1.0
+discord.py>=2.3
