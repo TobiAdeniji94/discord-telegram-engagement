@@ -1,0 +1,46 @@
+name: Deploy Bot to Contabo
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy Bot over SSH
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.CONTABO_HOST }}
+          username: ${{ secrets.CONTABO_USER }}
+          key: ${{ secrets.CONTABO_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+
+            cd ~/discord-telegram-engagement
+
+            echo "Pulling latest changes..."
+            git pull origin main
+
+            echo "Tagging current image for rollback..."
+            docker tag discord-telegram-engagement-bot:latest discord-telegram-engagement-bot:prev 2>/dev/null || true
+
+            echo "Building and restarting..."
+            docker compose up -d --build
+
+            echo "Waiting for health check..."
+            sleep 35
+
+            echo "Verifying deployment..."
+            if docker compose ps | grep -q "healthy"; then
+              echo "Deployment successful!"
+            else
+              echo "Health check failed, rolling back..."
+              docker compose down
+              docker tag discord-telegram-engagement-bot:prev discord-telegram-engagement-bot:latest
+              docker compose up -d
+              exit 1
+            fi
