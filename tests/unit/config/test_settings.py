@@ -30,26 +30,27 @@ class TestConfig:
         assert cfg.discord_require_pending_channel_match is True
 
     def test_default_search_queries(self, clean_env):
-        """Config should have default search queries."""
+        """Config should have default search queries (2026 expanded set)."""
         from twitter_intel.config import Config
 
         cfg = Config()
-        assert len(cfg.search_queries) == 3
+        assert len(cfg.search_queries) == 11
 
-        # Check competitor complaints query
+        # Check we have all category types
+        categories = [q.category_hint for q in cfg.search_queries]
+        assert categories.count("competitor_complaint") == 5
+        assert categories.count("solution_seeker") == 4
+        assert categories.count("brand_mention") == 2
+
+        # Check first competitor query has expanded coverage
         competitor_query = cfg.search_queries[0]
         assert competitor_query.category_hint == "competitor_complaint"
-        assert "chipper cash" in competitor_query.query.lower()
+        assert "chipper" in competitor_query.query.lower()
+        assert "grey" in competitor_query.query.lower()
 
-        # Check solution seeker query
-        seeker_query = cfg.search_queries[1]
-        assert seeker_query.category_hint == "solution_seeker"
-        assert "send money" in seeker_query.query.lower()
-
-        # Check brand mention query
-        brand_query = cfg.search_queries[2]
-        assert brand_query.category_hint == "brand_mention"
-        assert "yara.cash" in brand_query.query.lower()
+        # Check brand mention query exists
+        brand_queries = [q for q in cfg.search_queries if q.category_hint == "brand_mention"]
+        assert any("yara.cash" in q.query.lower() for q in brand_queries)
 
 
 class TestLoadConfig:
@@ -128,8 +129,8 @@ class TestLoadConfig:
         clean_env.setenv("SEARCH_QUERIES", "not valid json {{{")
 
         cfg = load_config()
-        # Should still have default queries
-        assert len(cfg.search_queries) == 3
+        # Should still have default queries (11 in 2026 expanded set)
+        assert len(cfg.search_queries) == 11
 
     def test_strips_at_from_brand_username(self, clean_env):
         """load_config should strip @ prefix from BRAND_X_USERNAME."""
