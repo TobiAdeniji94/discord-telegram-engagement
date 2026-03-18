@@ -347,6 +347,7 @@ class SearchRuntime:
     auth_denied_interactions: int = 0
     custom_reply_missing_pending: int = 0
     pending_channel_mismatch_denied: int = 0
+    stale_candidate_ids: set[str] = field(default_factory=set)
 
 
 def load_config() -> Config:
@@ -933,6 +934,7 @@ def build_xai_search_prompt(cfg: Config, job: SearchJob) -> str:
         else "No explicit tool date window is configured."
     )
     preferred_category = _preferred_category_for_hint(job.query.category_hint)
+    freshness_window = _build_freshness_window_instruction(cfg.max_tweet_age_minutes)
 
     return f"""{cfg.brand_context}
 
@@ -944,11 +946,13 @@ Lane:
 - Preferred category: {preferred_category}
 - Query mode hint: {job.query_type}
 - {date_window}
+- {freshness_window}
 
 Selection rules:
 - Interpret the search intent semantically even if it contains X-style operators such as lang:, since:, or -filter:.
 - Ignore retweets, obvious spam, giveaways, and unrelated chatter.
 - Prefer posts that are recent, specific, and worth a human reply.
+- If no posts meet the freshness requirement, return {{"candidates": []}}.
 - Return at most {cfg.max_discord_approvals_per_scan} candidates.
 - Only include candidates that deserve review.
 - Do not include irrelevant items in the final JSON.
@@ -989,6 +993,19 @@ Return STRICT JSON only with no markdown and no extra prose:
     }}
   ]
 }}"""
+
+
+def _build_freshness_window_instruction(max_tweet_age_minutes: int) -> str:
+    max_age_minutes = max(1, int(max_tweet_age_minutes))
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    min_created_at = now_utc - timedelta(minutes=max_age_minutes)
+    now_text = now_utc.isoformat().replace("+00:00", "Z")
+    min_created_text = min_created_at.isoformat().replace("+00:00", "Z")
+    return (
+        f"Current UTC time is {now_text}. Only return posts whose created_at_iso "
+        f"is within the last {max_age_minutes} minutes "
+        f"(created_at_iso >= {min_created_text})."
+    )
 
 
 def extract_output_text_from_xai_response(payload: dict) -> str:
@@ -2570,8 +2587,8 @@ class DiscordBot:
             if self.cfg.search_provider == "xai_x_search":
                 search_lines = (
                     "\nSearch telemetry:\n"
-                    f"  requests={self.runtime.api_requests_made} approvals={self.runtime.queued_to_discord}\n"
-                    f"  duplicates={self.runtime.duplicates_dropped}\n"
+                    f"  requests={self.runtime.api_requests_made} tweets={self.runtime.tweets_fetched}\n"
+                    f"  approvals={self.runtime.queued_to_discord} duplicates={self.runtime.duplicates_dropped} filtered={self.runtime.locally_filtered_out}\n"
                     f"  xai_requests={self.runtime.xai_requests_made} x_search_calls={self.runtime.xai_x_search_tool_calls}\n"
                     f"  prompt={self.runtime.xai_prompt_tokens} completion={self.runtime.xai_completion_tokens} reasoning={self.runtime.xai_reasoning_tokens}\n"
                     f"  cost_ticks={self.runtime.xai_cost_usd_ticks}"
@@ -3314,6 +3331,7 @@ async def scan_and_notify_provider(
             runtime,
             discord_bot,
         )
+        runtime.tweets_fetched += len(prepared_candidates)
         if not prepared_candidates:
             _log_no_candidates()
             return
@@ -3324,6 +3342,8 @@ async def scan_and_notify_provider(
 
         for prepared in prepared_candidates:
             tweet = prepared.tweet
+            if tweet.tweet_id in runtime.stale_candidate_ids:
+                continue
             if tweet.tweet_id in seen_ids:
                 runtime.duplicates_dropped += 1
                 discarded.append((tweet.tweet_id, tweet.local_score, "duplicate_in_scan"))
@@ -3334,6 +3354,12 @@ async def scan_and_notify_provider(
                 continue
 
             seen_ids.add(tweet.tweet_id)
+
+            if tweet.age_minutes > cfg.max_tweet_age_minutes:
+                runtime.locally_filtered_out += 1
+                runtime.stale_candidate_ids.add(tweet.tweet_id)
+                discarded.append((tweet.tweet_id, tweet.local_score, "too_old"))
+                continue
 
             if queued_count >= cfg.max_discord_approvals_per_scan:
                 runtime.locally_filtered_out += 1

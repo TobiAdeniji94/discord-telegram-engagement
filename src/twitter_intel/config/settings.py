@@ -194,6 +194,7 @@ class SearchRuntime:
     auth_denied_interactions: int = 0
     custom_reply_missing_pending: int = 0
     pending_channel_mismatch_denied: int = 0
+    stale_candidate_ids: set[str] = field(default_factory=set)
 
 
 def load_config() -> Config:

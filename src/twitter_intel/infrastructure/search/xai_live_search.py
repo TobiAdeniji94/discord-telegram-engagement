@@ -254,6 +254,9 @@ def build_xai_search_prompt(config: Config, job: SearchJob) -> str:
         else "No explicit tool date window is configured."
     )
     preferred_category = _preferred_category_for_hint(job.query.category_hint)
+    freshness_window = _build_freshness_window_instruction(
+        config.max_tweet_age_minutes
+    )
 
     return f"""{config.brand_context}
 
@@ -265,11 +268,13 @@ Lane:
 - Preferred category: {preferred_category}
 - Query mode hint: {job.query_type}
 - {date_window}
+- {freshness_window}
 
 Selection rules:
 - Interpret the search intent semantically even if it contains X-style operators such as lang:, since:, or -filter:.
 - Ignore retweets, obvious spam, giveaways, and unrelated chatter.
 - Prefer posts that are recent, specific, and worth a human reply.
+- If no posts meet the freshness requirement, return {{"candidates": []}}.
 - Return at most {config.max_discord_approvals_per_scan} candidates.
 - Only include candidates that deserve review.
 - Do not include irrelevant items in the final JSON.
@@ -310,6 +315,22 @@ Return STRICT JSON only with no markdown and no extra prose:
     }}
   ]
 }}"""
+
+
+def _build_freshness_window_instruction(max_tweet_age_minutes: int) -> str:
+    """
+    Tell xAI the exact rolling freshness window to enforce.
+    """
+    max_age_minutes = max(1, int(max_tweet_age_minutes))
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    min_created_at = now_utc - timedelta(minutes=max_age_minutes)
+    now_text = now_utc.isoformat().replace("+00:00", "Z")
+    min_created_text = min_created_at.isoformat().replace("+00:00", "Z")
+    return (
+        f"Current UTC time is {now_text}. Only return posts whose created_at_iso "
+        f"is within the last {max_age_minutes} minutes "
+        f"(created_at_iso >= {min_created_text})."
+    )
 
 
 def extract_output_text_from_xai_response(payload: dict[str, object]) -> str:

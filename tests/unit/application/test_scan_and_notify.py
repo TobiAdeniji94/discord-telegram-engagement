@@ -2,6 +2,7 @@
 Tests for scan and notify use case.
 """
 
+import asyncio
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -181,6 +182,7 @@ class TestScanAndNotifyUseCase:
         result = await use_case.execute()
 
         assert result.queued_count == 1
+        assert runtime.tweets_fetched == 1
         mock_notification_service.send_approval.assert_called_once()
 
     async def test_skips_already_processed(
@@ -282,7 +284,63 @@ class TestScanAndNotifyUseCase:
 
         assert result.queued_count == 0
         assert runtime.locally_filtered_out == 1
+        assert "123" in runtime.stale_candidate_ids
         mock_notification_service.send_approval.assert_not_called()
+
+    async def test_xai_flow_suppresses_repeat_stale_discards(
+        self, mock_config, mock_repository, mock_search_provider,
+        mock_classifier, mock_notification_service, runtime
+    ):
+        """Should not repost the same stale discard on later scans."""
+        mock_config.search_provider = "xai_x_search"
+        mock_config.max_tweet_age_minutes = 120
+        mock_config.debug_discarded_to_status = True
+
+        from twitter_intel.domain.entities.tweet import TweetCandidate, PreparedReviewCandidate
+
+        tweet = TweetCandidate(
+            tweet_id="123",
+            text="Old candidate",
+            author_username="user",
+            author_name="User",
+            author_followers=1000,
+            url="https://x.com/user/status/123",
+            created_at=datetime.now(timezone.utc),
+            likes=10,
+            retweets=5,
+            replies=3,
+            quotes=2,
+            views=1000,
+            age_minutes=720.0,
+            source_tab="Top",
+            search_query="test",
+            category_hint="brand_mention",
+        )
+        prepared = PreparedReviewCandidate(
+            tweet=tweet,
+            analysis={"category": "brand-mentions", "replies": []},
+            provider="xai_x_search",
+            source_query="test",
+        )
+
+        use_case = ScanAndNotifyUseCase(
+            config=mock_config,
+            repository=mock_repository,
+            search_provider=mock_search_provider,
+            classifier=mock_classifier,
+            notification_service=mock_notification_service,
+            runtime=runtime,
+        )
+        use_case._fetch_xai_candidates = AsyncMock(return_value=[prepared])
+
+        await use_case.execute()
+        await asyncio.sleep(0)
+        await use_case.execute()
+        await asyncio.sleep(0)
+
+        assert runtime.locally_filtered_out == 1
+        assert runtime.tweets_fetched == 2
+        mock_notification_service.send_status.assert_called_once()
 
     def test_parse_twitterapi_io_payload_shape(self, use_case):
         """Should parse twitterapi.io-style payload fields without warnings."""

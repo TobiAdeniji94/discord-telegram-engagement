@@ -101,6 +101,7 @@ class ScanAndNotifyUseCase:
         xAI returns pre-classified candidates with replies.
         """
         prepared_candidates = await self._fetch_xai_candidates()
+        self._runtime.tweets_fetched += len(prepared_candidates)
 
         if not prepared_candidates:
             self._log_no_candidates()
@@ -119,6 +120,11 @@ class ScanAndNotifyUseCase:
         for prepared in prepared_candidates:
             tweet = prepared.tweet
 
+            # If xAI keeps resurfacing the same stale post, ignore it after
+            # the first rejection so the status channel does not get spammed.
+            if tweet.tweet_id in self._runtime.stale_candidate_ids:
+                continue
+
             # Skip duplicates
             if tweet.tweet_id in seen_ids:
                 self._runtime.duplicates_dropped += 1
@@ -136,6 +142,7 @@ class ScanAndNotifyUseCase:
             # Enforce age cap parity with the standard provider flow
             if tweet.age_minutes > self._config.max_tweet_age_minutes:
                 self._runtime.locally_filtered_out += 1
+                self._runtime.stale_candidate_ids.add(tweet.tweet_id)
                 discarded.append((tweet.tweet_id, tweet.local_score, "too_old"))
                 continue
 

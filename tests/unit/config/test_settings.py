@@ -250,6 +250,7 @@ class TestSearchRuntime:
         assert runtime.provider_paused_until == 0.0
         assert runtime.last_query_run == {}
         assert runtime.empty_scan_counts == {}
+        assert runtime.stale_candidate_ids == set()
 
     def test_mutable_dict_fields_are_independent(self):
         """Each SearchRuntime instance should have independent dict fields."""
@@ -259,4 +260,6 @@ class TestSearchRuntime:
         runtime2 = SearchRuntime()
 
         runtime1.last_query_run["query1"] = 123.0
+        runtime1.stale_candidate_ids.add("tweet1")
         assert "query1" not in runtime2.last_query_run
+        assert "tweet1" not in runtime2.stale_candidate_ids
