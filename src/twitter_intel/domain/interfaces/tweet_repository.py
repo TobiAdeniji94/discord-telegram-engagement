@@ -151,6 +151,30 @@ class TweetRepository(ABC):
         """
         pass
 
+    @abstractmethod
+    def set_runtime_value(self, key: str, value: str) -> None:
+        """
+        Persist a runtime key/value pair.
+
+        Args:
+            key: Runtime state key
+            value: Runtime state value
+        """
+        pass
+
+    @abstractmethod
+    def get_runtime_value(self, key: str) -> str | None:
+        """
+        Retrieve a runtime key/value pair.
+
+        Args:
+            key: Runtime state key
+
+        Returns:
+            Stored value or None if missing
+        """
+        pass
+
     # Aliases for use case compatibility
     def save_pending(
         self,

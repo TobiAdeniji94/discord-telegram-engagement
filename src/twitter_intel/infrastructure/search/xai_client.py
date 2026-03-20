@@ -183,26 +183,21 @@ def build_x_search_tool_config(
     Returns:
         Tool configuration dict for xAI API
     """
-    tool = {
-        "type": "x_search",
-        "x_search": {
-            "enabled": True,
-        },
-    }
+    tool: dict[str, Any] = {"type": "x_search"}
 
     if enable_image_understanding:
-        tool["x_search"]["image_understanding"] = True
+        tool["enable_image_understanding"] = True
     if enable_video_understanding:
-        tool["x_search"]["video_understanding"] = True
+        tool["enable_video_understanding"] = True
 
     if excluded_handles:
-        tool["x_search"]["excluded_accounts"] = excluded_handles
+        tool["excluded_x_handles"] = excluded_handles[:10]
     if allowed_handles:
-        tool["x_search"]["accounts"] = allowed_handles
+        tool["allowed_x_handles"] = allowed_handles[:10]
 
     if start_date:
-        tool["x_search"]["start_date"] = start_date
+        tool["from_date"] = start_date
     if end_date:
-        tool["x_search"]["end_date"] = end_date
+        tool["to_date"] = end_date
 
     return tool

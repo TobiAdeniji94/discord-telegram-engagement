@@ -38,52 +38,51 @@ The bot supports four search modes:
 
 ```
 twitter_intel/
-├── bot_legacy.py              # Production entry point (monolith)
-├── pyproject.toml             # Python packaging and dependencies
-├── Dockerfile                 # Container image
-├── docker-compose.yml         # Local deployment
-├── .env.example               # Environment template
-│
-├── src/twitter_intel/         # Modular architecture (v2)
-│   ├── main.py                # New entry point (WIP)
-│   ├── config/                # Settings, search queries, env utilities
-│   ├── domain/
-│   │   ├── entities/          # TweetCandidate, TweetCategory
-│   │   ├── interfaces/        # Abstract base classes
-│   │   └── services/          # Scoring, filtering
-│   ├── infrastructure/
-│   │   ├── database/          # SQLite repository
-│   │   ├── search/            # TwitterAPI.io, xAI, twscrape
-│   │   ├── ai/                # Gemini classifier, prompts
-│   │   └── notifications/     # Discord, Telegram
-│   ├── application/           # Container (dependency injection)
-│   └── exceptions/            # Error hierarchy
-│
-└── tests/                     # Unit and integration tests
-    ├── unit/
-    └── integration/
+|-- pyproject.toml             # Python packaging and dependencies
+|-- Dockerfile                 # Container image
+|-- docker-compose.yml         # Local deployment
+|-- .env.example               # Environment template
+|
+|-- src/twitter_intel/         # Modular application
+|   |-- main.py                # Production entry point
+|   |-- config/                # Settings, search queries, env utilities
+|   |-- domain/
+|   |   |-- entities/          # TweetCandidate, TweetCategory
+|   |   |-- interfaces/        # Abstract base classes
+|   |   `-- services/          # Scoring, filtering
+|   |-- infrastructure/
+|   |   |-- database/          # SQLite repository
+|   |   |-- search/            # TwitterAPI.io, xAI, twscrape
+|   |   |-- ai/                # Gemini classifier, prompts
+|   |   `-- notifications/     # Discord, Telegram
+|   |-- application/           # Container and use cases
+|   `-- exceptions/            # Error hierarchy
+|
+`-- tests/                     # Unit and integration tests
+    |-- unit/
+    `-- integration/
 ```
 
 ### Architecture Status
 
-The codebase has been refactored from a 3,400-line monolith into a clean modular architecture:
+The codebase now runs through the modular entry point.
 
 | Component | Status | Location |
 |-----------|--------|----------|
-| Configuration | ✅ Extracted | `src/twitter_intel/config/` |
-| Domain entities | ✅ Extracted | `src/twitter_intel/domain/entities/` |
-| Interfaces | ✅ Extracted | `src/twitter_intel/domain/interfaces/` |
-| Scoring service | ✅ Extracted | `src/twitter_intel/domain/services/` |
-| Database layer | ✅ Extracted | `src/twitter_intel/infrastructure/database/` |
-| Search providers | ✅ Extracted | `src/twitter_intel/infrastructure/search/` |
-| AI classifiers | ✅ Extracted | `src/twitter_intel/infrastructure/ai/` |
-| Notifications | ✅ Extracted | `src/twitter_intel/infrastructure/notifications/` |
-| Scan loop | ⏳ In bot_legacy.py | Orchestration not yet migrated |
-| Discord Gateway | ⏳ In bot_legacy.py | Button interactions not yet migrated |
+| Configuration | Complete | `src/twitter_intel/config/` |
+| Domain entities | Complete | `src/twitter_intel/domain/entities/` |
+| Interfaces | Complete | `src/twitter_intel/domain/interfaces/` |
+| Scoring service | Complete | `src/twitter_intel/domain/services/` |
+| Database layer | Complete | `src/twitter_intel/infrastructure/database/` |
+| Search providers | Complete | `src/twitter_intel/infrastructure/search/` |
+| AI classifiers | Complete | `src/twitter_intel/infrastructure/ai/` |
+| Notifications | Complete | `src/twitter_intel/infrastructure/notifications/` |
+| Scan loop | Complete | `src/twitter_intel/application/` |
+| Discord Gateway | Complete | `src/twitter_intel/infrastructure/notifications/` |
 
-**For production use:** Run `bot_legacy.py` (the Dockerfile does this by default).
+**For production use:** Run `python -m twitter_intel.main`.
 
-**For development:** The modular components are fully tested (216 tests) and can be imported from `twitter_intel.*`.
+**For development:** The modular components are fully tested and can be imported from `twitter_intel.*`.
 
 ## Requirements
 
@@ -420,3 +419,4 @@ Security operations checklist: see [`SECURITY.md`](SECURITY.md).
 - If `DEBUG_DISCARDED_TO_STATUS=true`, the bot also sends that sample to `#bot-status`.
 - In `xai_x_search`, Grok replaces Gemini for discovery, classification, and reply drafting.
 - The current Gemini integration uses `google-generativeai`, which emits a deprecation warning at runtime. The code still works, but migration to `google.genai` is a future maintenance task.
+

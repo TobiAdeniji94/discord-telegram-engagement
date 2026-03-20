@@ -12,12 +12,15 @@ import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-from twitter_intel.config import Config, SearchJob, SearchRuntime
+from twitter_intel.config import Config, SearchJob, SearchRuntime, SearchQuery
 from twitter_intel.domain.entities.category import TweetCategory
 from twitter_intel.domain.entities.tweet import PreparedReviewCandidate, TweetCandidate
 from twitter_intel.domain.interfaces import NotificationService
 from twitter_intel.exceptions import XaiAuthError, XaiRateLimitError
-from twitter_intel.infrastructure.search.xai_client import XaiClient
+from twitter_intel.infrastructure.search.xai_client import (
+    XaiClient,
+    build_x_search_tool_config,
+)
 
 log = logging.getLogger(__name__)
 
@@ -62,8 +65,15 @@ async def fetch_candidates_from_xai_search(
         runtime.last_fetch_summary = "no_due_queries"
         return []
 
-    from_date, to_date = _search_date_window(config.search_since_days)
-    tool_config = _build_xai_tool_config(config, from_date, to_date)
+    from_date, to_date = _search_date_window(config.search_since_days, runtime)
+    tool_config = build_x_search_tool_config(
+        enable_image_understanding=config.xai_enable_image_understanding,
+        enable_video_understanding=config.xai_enable_video_understanding,
+        excluded_handles=config.xai_excluded_x_handles or None,
+        allowed_handles=config.xai_allowed_x_handles or None,
+        start_date=from_date,
+        end_date=to_date,
+    )
 
     prepared_candidates: list[PreparedReviewCandidate] = []
     remaining_budget = request_budget
@@ -80,7 +90,7 @@ async def fetch_candidates_from_xai_search(
             break
 
         runtime.last_query_run[job.query.query] = time.time()
-        prompt = build_xai_search_prompt(config, job)
+        prompt = build_xai_search_prompt(config, job, runtime)
 
         try:
             runtime.api_requests_made += 1
@@ -174,41 +184,24 @@ async def fetch_candidates_from_xai_search(
     return prepared_candidates
 
 
-def _search_date_window(search_since_days: int | None) -> tuple[str | None, str | None]:
-    if search_since_days is None:
-        return None, None
-
+def _search_date_window(
+    search_since_days: int | None,
+    runtime: SearchRuntime | None = None,
+) -> tuple[str | None, str | None]:
     end_date = datetime.now(timezone.utc).date()
-    start_date = end_date - timedelta(days=search_since_days)
+    start_date = end_date - timedelta(days=search_since_days) if search_since_days is not None else None
+
+    catchup_start = getattr(runtime, "restart_catchup_start_utc", None)
+    catchup_end = getattr(runtime, "restart_catchup_end_utc", None)
+    if catchup_start:
+        catchup_start_date = catchup_start.astimezone(timezone.utc).date()
+        start_date = catchup_start_date if start_date is None else min(start_date, catchup_start_date)
+    if catchup_end:
+        end_date = max(end_date, catchup_end.astimezone(timezone.utc).date())
+
+    if start_date is None:
+        return None, None
     return start_date.isoformat(), end_date.isoformat()
-
-
-def _build_xai_tool_config(
-    config: Config,
-    from_date: str | None,
-    to_date: str | None,
-) -> dict[str, object]:
-    """
-    Build the tool payload using the same shape as the legacy bot.
-    """
-    tool: dict[str, object] = {"type": "x_search"}
-
-    if from_date:
-        tool["from_date"] = from_date
-    if to_date:
-        tool["to_date"] = to_date
-
-    if config.xai_allowed_x_handles:
-        tool["allowed_x_handles"] = config.xai_allowed_x_handles[:10]
-    elif config.xai_excluded_x_handles:
-        tool["excluded_x_handles"] = config.xai_excluded_x_handles[:10]
-
-    if config.xai_enable_image_understanding:
-        tool["enable_image_understanding"] = True
-    if config.xai_enable_video_understanding:
-        tool["enable_video_understanding"] = True
-
-    return tool
 
 
 def _preferred_category_for_hint(category_hint: str) -> str:
@@ -243,43 +236,107 @@ def _hint_for_category_value(category_value: str) -> str:
     return mapping.get(category_value, "brand_mention")
 
 
-def build_xai_search_prompt(config: Config, job: SearchJob) -> str:
+def _format_list(values: list[str]) -> str:
+    return ", ".join(value for value in values if str(value or "").strip())
+
+
+def _active_event_window_for_query(
+    config: Config,
+    query: SearchQuery,
+) -> tuple[datetime, datetime] | None:
+    if config.search_event_mode != "anchored" or not config.search_event_anchor_utc:
+        return None
+
+    brand_family = str(query.brand_family or "").strip().lower()
+    if not brand_family or brand_family not in config.search_event_brands:
+        return None
+
+    lower = config.search_event_anchor_utc + timedelta(
+        minutes=max(0, config.search_event_min_offset_minutes)
+    )
+    upper = config.search_event_anchor_utc + timedelta(
+        minutes=max(1, config.search_event_max_offset_minutes)
+    )
+    return lower, upper
+
+
+def _build_lane_context_lines(query: SearchQuery) -> list[str]:
+    lines = [
+        f"- Lane ID: {query.lane_id}",
+        f"- Lane goal: {query.intent_summary or query.description}",
+        f"- Query mode hint: {query.query_type}",
+    ]
+
+    if query.brand_family:
+        lines.append(f"- Brand family: {query.brand_family}")
+    if query.brand_aliases:
+        lines.append(f"- Brand aliases to consider: {_format_list(query.brand_aliases)}")
+    if query.brand_handles:
+        lines.append(
+            "- Handle context to consider in mentions, replies, and quote posts: "
+            f"{_format_list(['@' + handle for handle in query.brand_handles])}"
+        )
+    if query.issue_focus:
+        lines.append(f"- Issues to prioritize: {_format_list(query.issue_focus)}")
+    if query.geo_focus:
+        lines.append(f"- Geographic context: {_format_list(query.geo_focus)}")
+    if query.query:
+        lines.append(f"- Legacy query hint: {query.query}")
+
+    return lines
+
+
+def build_xai_search_prompt(
+    config: Config,
+    job: SearchJob,
+    runtime: SearchRuntime | None = None,
+) -> str:
     """
     Build the xAI prompt for a specific due search lane.
     """
-    from_date, to_date = _search_date_window(config.search_since_days)
-    date_window = (
-        f"Use the tool's date window from {from_date} to {to_date} (UTC dates inclusive)."
-        if from_date and to_date
-        else "No explicit tool date window is configured."
-    )
+    from_date, to_date = _search_date_window(config.search_since_days, runtime)
     preferred_category = _preferred_category_for_hint(job.query.category_hint)
-    freshness_window = _build_freshness_window_instruction(
-        config.max_tweet_age_minutes
+    reply_option_count = max(1, int(config.num_reply_options or 1))
+    lane_context = "\n".join(_build_lane_context_lines(job.query))
+    date_window_text = (
+        f"- The API already constrains x_search to UTC dates from {from_date} to {to_date}."
+        if from_date and to_date
+        else "- No explicit API date window is configured for this run."
     )
+    event_window = _active_event_window_for_query(config, job.query)
+    event_window_text = ""
+    if event_window:
+        lower, upper = event_window
+        event_window_text = (
+            "\n- Anchored-event window is active for this lane.\n"
+            f"- Only include posts where created_at_iso >= "
+            f"{lower.isoformat().replace('+00:00', 'Z')} and <= "
+            f"{upper.isoformat().replace('+00:00', 'Z')}."
+        )
 
     return f"""{config.brand_context}
 
-You are curating X posts for Yara.cash. Use the x_search tool to find recent, high-signal, actionable posts that match the lane below.
+You are curating X posts for Yara.cash with the x_search tool.
 
-Lane:
-- Description: {job.query.description}
-- Search intent: {job.query.query}
+Search brief:
+{lane_context}
 - Preferred category: {preferred_category}
-- Query mode hint: {job.query_type}
-- {date_window}
-- {freshness_window}
+{date_window_text}
+- {_build_freshness_window_instruction(config.max_tweet_age_minutes, runtime)}{event_window_text}
 
 Selection rules:
-- Interpret the search intent semantically even if it contains X-style operators such as lang:, since:, or -filter:.
-- Ignore retweets, obvious spam, giveaways, and unrelated chatter.
-- Prefer posts that are recent, specific, and worth a human reply.
-- If no posts meet the freshness requirement, return {{"candidates": []}}.
+- Search semantically. Do not require exact boolean keyword overlap from the legacy query hint.
+- Consider original posts, replies, and quote posts when the user's own text describes the issue.
+- Do not rely only on official handles appearing in plain text; mentions and replies count.
+- Ignore retweets, obvious spam, promos, giveaways, memes, engagement bait, and unrelated chatter.
+- Prefer specific, actionable posts from real users that a human can meaningfully reply to.
+- Official competitor or brand posts may appear for context but should not be returned as candidates.
+- If no posts meet the freshness and relevance requirements, return {{"candidates": []}}.
 - Return at most {config.max_discord_approvals_per_scan} candidates.
 - Only include candidates that deserve review.
 - Do not include irrelevant items in the final JSON.
 - Preserve the exact X post URL in tweet_url.
-- Produce 1 to {config.num_reply_options} reply options per candidate.
+- Produce 1 to {reply_option_count} reply options per candidate.
 - Keep each reply under 280 characters and aligned with Yara.cash positioning.
 
 Allowed categories:
@@ -317,10 +374,71 @@ Return STRICT JSON only with no markdown and no extra prose:
 }}"""
 
 
-def _build_freshness_window_instruction(max_tweet_age_minutes: int) -> str:
+def build_manual_grok_prompt(
+    config: Config,
+    job: SearchJob,
+    runtime: SearchRuntime | None = None,
+) -> str:
+    """
+    Build a manual Grok test prompt from the same structured lane definition.
+    """
+    from_date, to_date = _search_date_window(config.search_since_days, runtime)
+    lane_context = "\n".join(_build_lane_context_lines(job.query))
+    preferred_category = _preferred_category_for_hint(job.query.category_hint)
+    prompt_lines = [
+        "Use x_search to test this lane manually for Yara.cash.",
+        "",
+        "Lane:",
+        lane_context,
+        f"- Preferred category: {preferred_category}",
+        (
+            f"- If your tool runner supports it, set x_search from_date={from_date} "
+            f"and to_date={to_date}."
+            if from_date and to_date
+            else "- Use the current day window that matches your test scenario."
+        ),
+        f"- {_build_freshness_window_instruction(config.max_tweet_age_minutes, runtime)}",
+    ]
+
+    event_window = _active_event_window_for_query(config, job.query)
+    if event_window:
+        lower, upper = event_window
+        prompt_lines.append(
+            "- Keep only posts in the anchored-event window: "
+            f"{lower.isoformat().replace('+00:00', 'Z')} to "
+            f"{upper.isoformat().replace('+00:00', 'Z')}."
+        )
+
+    prompt_lines.extend(
+        [
+            "",
+            "Rules:",
+            "- Search semantically, not just by exact keyword overlap.",
+            "- Consider replies and quote posts when the user's own text carries the complaint or intent.",
+            "- Ignore spam, promos, memes, and retweets.",
+            "- Do not return official brand-authored posts as candidates.",
+            "- Return strict JSON with a candidates array.",
+        ]
+    )
+    return "\n".join(prompt_lines)
+
+
+def _build_freshness_window_instruction(
+    max_tweet_age_minutes: int,
+    runtime: SearchRuntime | None = None,
+) -> str:
     """
     Tell xAI the exact rolling freshness window to enforce.
     """
+    catchup_start = getattr(runtime, "restart_catchup_start_utc", None)
+    catchup_end = getattr(runtime, "restart_catchup_end_utc", None)
+    if catchup_start and catchup_end:
+        return (
+            "Restart catch-up is active for this scan. Only return posts whose "
+            f"created_at_iso is >= {catchup_start.isoformat().replace('+00:00', 'Z')} "
+            f"and <= {catchup_end.isoformat().replace('+00:00', 'Z')}."
+        )
+
     max_age_minutes = max(1, int(max_tweet_age_minutes))
     now_utc = datetime.now(timezone.utc).replace(microsecond=0)
     min_created_at = now_utc - timedelta(minutes=max_age_minutes)
@@ -541,6 +659,8 @@ def select_due_queries(
             continue
         if brand_direct_enabled and query.category_hint == "brand_mention":
             continue
+        if not _should_run_query(config, query):
+            continue
 
         last_run = runtime.last_query_run.get(query.query, 0.0)
         if now_ts - last_run < max(60, query.cooldown_seconds):
@@ -557,20 +677,35 @@ def select_due_queries(
 
     due_jobs.sort(
         key=lambda job: (
-            _lane_priority(job.query.category_hint, brand_direct_enabled),
+            _lane_priority(config, job.query, brand_direct_enabled),
             runtime.last_query_run.get(job.query.query, 0.0),
+            job.query.priority,
         )
     )
     return due_jobs[:request_budget]
 
 
-def _lane_priority(category_hint: str, brand_direct_enabled: bool) -> int:
-    if category_hint == "solution_seeker":
+def _should_run_query(config: Config, query: SearchQuery) -> bool:
+    if config.search_event_mode != "anchored":
+        return query.strategy_mode != "anchored_event"
+
+    brand_family = str(query.brand_family or "").strip().lower()
+    if query.strategy_mode == "anchored_event":
+        return not brand_family or brand_family in config.search_event_brands
+
+    return bool(brand_family and brand_family in config.search_event_brands)
+
+
+def _lane_priority(config: Config, query: SearchQuery, brand_direct_enabled: bool) -> int:
+    if _active_event_window_for_query(config, query):
         return 0
+    category_hint = query.category_hint
+    if category_hint == "solution_seeker":
+        return 2
     if category_hint == "competitor_complaint":
         return 1
     if category_hint == "brand_mention":
-        return 2 if brand_direct_enabled else 3
+        return 4 if brand_direct_enabled else 3
     return 4
 
 

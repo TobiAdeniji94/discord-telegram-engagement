@@ -9,6 +9,7 @@ This module provides:
 
 from twitter_intel.config.env_utils import (
     env_flag,
+    parse_csv_env_list,
     parse_handle_env_list,
     parse_id_env_list,
     resolve_data_path,
@@ -26,6 +27,7 @@ from twitter_intel.config.settings import (
 __all__ = [
     # Environment utilities
     "env_flag",
+    "parse_csv_env_list",
     "parse_handle_env_list",
     "parse_id_env_list",
     "resolve_data_path",

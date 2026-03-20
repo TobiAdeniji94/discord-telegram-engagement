@@ -5,6 +5,7 @@ Tests for ScanScheduler.
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 from twitter_intel.application.scheduler import ScanScheduler
 from twitter_intel.application.use_cases.scan_and_notify import ScanResult
@@ -56,6 +57,8 @@ class TestScanScheduler:
                 "solution-seekers": 20,
             }
         })
+        repo.get_runtime_value = MagicMock(return_value=None)
+        repo.set_runtime_value = MagicMock()
         return repo
 
     @pytest.fixture
@@ -87,6 +90,7 @@ class TestScanScheduler:
 
         mock_scan_use_case.execute.assert_called_once()
         assert runtime.scans_completed == 1
+        scheduler._repository.set_runtime_value.assert_called_once()
 
     async def test_multiple_scan_cycles(self, scheduler, mock_scan_use_case, runtime):
         """Should increment scan count for each cycle."""
@@ -134,6 +138,26 @@ class TestScanScheduler:
         scheduler._running = True
         await scheduler.stop()
         assert scheduler._running is False
+
+    def test_initialize_restart_catchup_sets_runtime_window(
+        self,
+        scheduler,
+        mock_repository,
+        runtime,
+    ):
+        """Scheduler should activate one-cycle catch-up after downtime."""
+        five_minutes_ago = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).replace(microsecond=0)
+        mock_repository.get_runtime_value.return_value = (
+            five_minutes_ago.isoformat().replace("+00:00", "Z")
+        )
+        scheduler._config.poll_interval = 60
+
+        scheduler._initialize_restart_catchup()
+
+        assert runtime.restart_catchup_start_utc == five_minutes_ago
+        assert runtime.restart_catchup_end_utc is not None
 
 
 class TestScanLoopManualOnly:

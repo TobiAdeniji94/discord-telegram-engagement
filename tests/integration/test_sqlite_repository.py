@@ -329,3 +329,20 @@ class TestGetStats:
         assert stats["by_category"]["brand-mentions"] == 2
         assert stats["by_category"]["solution-seekers"] == 1
         assert stats["by_category"]["competitor-complaints"] == 1
+
+
+class TestRuntimeState:
+    """Tests for persisted runtime state helpers."""
+
+    def test_set_and_get_runtime_value(self, repository: SqliteTweetRepository):
+        """Runtime values should round-trip via bot_stats."""
+        repository.set_runtime_value("last_scan_completed_at", "2026-03-19T10:00:00Z")
+
+        assert repository.get_runtime_value("last_scan_completed_at") == "2026-03-19T10:00:00Z"
+
+    def test_get_runtime_value_returns_none_when_missing(
+        self,
+        repository: SqliteTweetRepository,
+    ):
+        """Missing runtime values should return None."""
+        assert repository.get_runtime_value("missing_key") is None

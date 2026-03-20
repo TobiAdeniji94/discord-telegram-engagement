@@ -30,27 +30,24 @@ class TestConfig:
         assert cfg.discord_require_pending_channel_match is True
 
     def test_default_search_queries(self, clean_env):
-        """Config should have default search queries (2026 expanded set)."""
+        """Config should have default structured search lanes."""
         from twitter_intel.config import Config
 
         cfg = Config()
-        assert len(cfg.search_queries) == 11
+        assert len(cfg.search_queries) == 8
 
-        # Check we have all category types
         categories = [q.category_hint for q in cfg.search_queries]
-        assert categories.count("competitor_complaint") == 5
-        assert categories.count("solution_seeker") == 4
-        assert categories.count("brand_mention") == 2
+        assert categories.count("competitor_complaint") == 7
+        assert categories.count("solution_seeker") == 1
+        assert categories.count("brand_mention") == 0
 
-        # Check first competitor query has expanded coverage
         competitor_query = cfg.search_queries[0]
         assert competitor_query.category_hint == "competitor_complaint"
-        assert "chipper" in competitor_query.query.lower()
-        assert "grey" in competitor_query.query.lower()
+        assert competitor_query.brand_family == "chipper"
+        assert "Chipper" in competitor_query.brand_aliases
 
-        # Check brand mention query exists
         brand_queries = [q for q in cfg.search_queries if q.category_hint == "brand_mention"]
-        assert any("yara.cash" in q.query.lower() for q in brand_queries)
+        assert brand_queries == []
 
 
 class TestLoadConfig:
@@ -107,11 +104,14 @@ class TestLoadConfig:
                 "category_hint": "solution_seeker",
                 "description": "Test description",
                 "cooldown_seconds": 600,
+                "lane_id": "lane-one",
+                "issue_focus": ["payouts", "cards"],
             },
             {
                 "query": "test query 2",
                 "category_hint": "brand_mention",
                 "description": "Another test",
+                "brand_handles": ["@brandhandle"],
             },
         ]
         clean_env.setenv("SEARCH_QUERIES", json.dumps(custom_queries))
@@ -120,7 +120,10 @@ class TestLoadConfig:
         assert len(cfg.search_queries) == 2
         assert cfg.search_queries[0].query == "test query 1"
         assert cfg.search_queries[0].cooldown_seconds == 600
+        assert cfg.search_queries[0].lane_id == "lane-one"
+        assert cfg.search_queries[0].issue_focus == ["payouts", "cards"]
         assert cfg.search_queries[1].query == "test query 2"
+        assert cfg.search_queries[1].brand_handles == ["brandhandle"]
 
     def test_invalid_search_queries_json_uses_defaults(self, clean_env):
         """load_config should use defaults if SEARCH_QUERIES JSON is invalid."""
@@ -129,8 +132,7 @@ class TestLoadConfig:
         clean_env.setenv("SEARCH_QUERIES", "not valid json {{{")
 
         cfg = load_config()
-        # Should still have default queries (11 in 2026 expanded set)
-        assert len(cfg.search_queries) == 11
+        assert len(cfg.search_queries) == 8
 
     def test_strips_at_from_brand_username(self, clean_env):
         """load_config should strip @ prefix from BRAND_X_USERNAME."""
@@ -171,6 +173,37 @@ class TestLoadConfig:
 
         cfg = load_config()
         assert cfg.search_since_days == 7
+
+    def test_loads_search_event_mode(self, clean_env):
+        """load_config should parse anchored-event search settings."""
+        from twitter_intel.config import load_config
+
+        clean_env.setenv("SEARCH_EVENT_MODE", "anchored")
+        clean_env.setenv("SEARCH_EVENT_ANCHOR_UTC", "2026-03-19T08:00:00Z")
+        clean_env.setenv("SEARCH_EVENT_MIN_OFFSET_MINUTES", "30")
+        clean_env.setenv("SEARCH_EVENT_MAX_OFFSET_MINUTES", "360")
+        clean_env.setenv("SEARCH_EVENT_BRANDS", "chipper,grey")
+
+        cfg = load_config()
+        assert cfg.search_event_mode == "anchored"
+        assert cfg.search_event_anchor_utc is not None
+        assert cfg.search_event_anchor_utc.isoformat() == "2026-03-19T08:00:00+00:00"
+        assert cfg.search_event_min_offset_minutes == 30
+        assert cfg.search_event_max_offset_minutes == 360
+        assert cfg.search_event_brands == ["chipper", "grey"]
+
+    def test_invalid_search_event_config_disables_mode(self, clean_env):
+        """Invalid anchored-event settings should fail closed to off."""
+        from twitter_intel.config import load_config
+
+        clean_env.setenv("SEARCH_EVENT_MODE", "anchored")
+        clean_env.setenv("SEARCH_EVENT_ANCHOR_UTC", "not-a-date")
+        clean_env.setenv("SEARCH_EVENT_BRANDS", "")
+
+        cfg = load_config()
+        assert cfg.search_event_mode == "off"
+        assert cfg.search_event_anchor_utc is None
+        assert cfg.search_event_brands == []
 
     def test_invalid_search_since_days_ignored(self, clean_env):
         """load_config should ignore invalid SEARCH_SINCE_DAYS."""
@@ -252,6 +285,8 @@ class TestSearchRuntime:
         assert runtime.last_query_run == {}
         assert runtime.empty_scan_counts == {}
         assert runtime.stale_candidate_ids == set()
+        assert runtime.restart_catchup_start_utc is None
+        assert runtime.restart_catchup_end_utc is None
 
     def test_mutable_dict_fields_are_independent(self):
         """Each SearchRuntime instance should have independent dict fields."""

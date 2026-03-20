@@ -207,6 +207,25 @@ class SqliteTweetRepository(TweetRepository):
             return {"url": row[0], "author": row[1]}
         return None
 
+    def set_runtime_value(self, key: str, value: str) -> None:
+        """Persist a runtime key/value pair in bot_stats."""
+        self._conn.execute(
+            """INSERT OR REPLACE INTO bot_stats (key, value)
+               VALUES (?, ?)""",
+            (key, value),
+        )
+        self._conn.commit()
+
+    def get_runtime_value(self, key: str) -> str | None:
+        """Retrieve a runtime key/value pair from bot_stats."""
+        row = self._conn.execute(
+            "SELECT value FROM bot_stats WHERE key=?",
+            (key,),
+        ).fetchone()
+        if row:
+            return row[0]
+        return None
+
     def close(self) -> None:
         """Close the database connection."""
         self._conn.close()

@@ -9,7 +9,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -116,9 +116,15 @@ class ScanAndNotifyUseCase:
         seen_ids: set[str] = set()
         queued_count = 0
         discarded: list[tuple[str, float, str]] = []
+        lane_lookup = {
+            getattr(query, "query", ""): query
+            for query in getattr(self._config, "search_queries", [])
+            if getattr(query, "query", "")
+        }
 
         for prepared in prepared_candidates:
             tweet = prepared.tweet
+            lane = lane_lookup.get(prepared.source_query)
 
             # If xAI keeps resurfacing the same stale post, ignore it after
             # the first rejection so the status channel does not get spammed.
@@ -144,6 +150,21 @@ class ScanAndNotifyUseCase:
                 self._runtime.locally_filtered_out += 1
                 self._runtime.stale_candidate_ids.add(tweet.tweet_id)
                 discarded.append((tweet.tweet_id, tweet.local_score, "too_old"))
+                continue
+
+            if self._is_official_lane_author(tweet, lane):
+                self._runtime.locally_filtered_out += 1
+                discarded.append((tweet.tweet_id, tweet.local_score, "official_author"))
+                continue
+
+            if self._is_outside_anchored_event_window(tweet, lane):
+                self._runtime.locally_filtered_out += 1
+                discarded.append((tweet.tweet_id, tweet.local_score, "outside_event_window"))
+                continue
+
+            if self._is_outside_restart_catchup_window(tweet):
+                self._runtime.locally_filtered_out += 1
+                discarded.append((tweet.tweet_id, tweet.local_score, "outside_restart_catchup"))
                 continue
 
             # Check approval cap
@@ -297,6 +318,54 @@ class ScanAndNotifyUseCase:
             log.error(f"xAI search failed: {exc}")
             self._runtime.last_fetch_summary = f"error:{exc}"
             return []
+
+    def _is_official_lane_author(self, tweet: TweetCandidate, lane: Any | None) -> bool:
+        if lane is None:
+            return False
+
+        official_handles = {
+            str(handle or "").strip().lstrip("@").lower()
+            for handle in getattr(lane, "exclude_author_handles", []) or []
+        }
+        if not official_handles:
+            return False
+
+        return tweet.author_username.strip().lstrip("@").lower() in official_handles
+
+    def _is_outside_anchored_event_window(
+        self,
+        tweet: TweetCandidate,
+        lane: Any | None,
+    ) -> bool:
+        if getattr(self._config, "search_event_mode", "off") != "anchored":
+            return False
+        if getattr(self._config, "search_event_anchor_utc", None) is None:
+            return False
+        if lane is None:
+            return False
+
+        brand_family = str(getattr(lane, "brand_family", "") or "").strip().lower()
+        event_brands = {
+            str(brand or "").strip().lower()
+            for brand in getattr(self._config, "search_event_brands", []) or []
+        }
+        if not brand_family or brand_family not in event_brands:
+            return False
+
+        lower_bound = self._config.search_event_anchor_utc + timedelta(
+            minutes=max(0, int(getattr(self._config, "search_event_min_offset_minutes", 30)))
+        )
+        upper_bound = self._config.search_event_anchor_utc + timedelta(
+            minutes=max(1, int(getattr(self._config, "search_event_max_offset_minutes", 360)))
+        )
+        return not (lower_bound <= tweet.created_at <= upper_bound)
+
+    def _is_outside_restart_catchup_window(self, tweet: TweetCandidate) -> bool:
+        lower_bound = getattr(self._runtime, "restart_catchup_start_utc", None)
+        upper_bound = getattr(self._runtime, "restart_catchup_end_utc", None)
+        if lower_bound is None or upper_bound is None:
+            return False
+        return not (lower_bound <= tweet.created_at <= upper_bound)
 
     async def _fetch_standard_candidates(self) -> list[TweetCandidate]:
         """Fetch candidates from standard search provider."""

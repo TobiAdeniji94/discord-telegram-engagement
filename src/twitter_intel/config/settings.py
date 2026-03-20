@@ -9,9 +9,11 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from twitter_intel.config.env_utils import (
     env_flag,
+    parse_csv_env_list,
     parse_handle_env_list,
     parse_id_env_list,
     resolve_db_path,
@@ -77,6 +79,11 @@ class Config:
     # --- Search Provider ---
     search_provider: str = "twitterapi_io"
     search_since_days: int | None = None
+    search_event_mode: str = "off"
+    search_event_anchor_utc: datetime | None = None
+    search_event_min_offset_minutes: int = 30
+    search_event_max_offset_minutes: int = 360
+    search_event_brands: list[str] = field(default_factory=list)
     twitterapi_io_api_key: str = ""
     brand_x_username: str = ""
 
@@ -195,6 +202,8 @@ class SearchRuntime:
     custom_reply_missing_pending: int = 0
     pending_channel_mismatch_denied: int = 0
     stale_candidate_ids: set[str] = field(default_factory=set)
+    restart_catchup_start_utc: datetime | None = None
+    restart_catchup_end_utc: datetime | None = None
 
 
 def load_config() -> Config:
@@ -207,8 +216,17 @@ def load_config() -> Config:
     # Parse search queries from JSON env var, or use defaults
     raw_queries = os.getenv("SEARCH_QUERIES")
     raw_since_days = os.getenv("SEARCH_SINCE_DAYS", "").strip()
+    raw_event_mode = os.getenv("SEARCH_EVENT_MODE", "off").strip().lower()
+    raw_event_anchor = os.getenv("SEARCH_EVENT_ANCHOR_UTC", "").strip()
+    raw_event_min = os.getenv("SEARCH_EVENT_MIN_OFFSET_MINUTES", "").strip()
+    raw_event_max = os.getenv("SEARCH_EVENT_MAX_OFFSET_MINUTES", "").strip()
     search_queries = None
     search_since_days = None
+    search_event_mode = raw_event_mode if raw_event_mode in {"off", "anchored"} else "off"
+    search_event_anchor_utc = None
+    search_event_min_offset_minutes = 30
+    search_event_max_offset_minutes = 360
+    event_config_valid = True
 
     if raw_queries:
         try:
@@ -226,9 +244,56 @@ def load_config() -> Config:
         except ValueError:
             log.warning("Ignoring invalid SEARCH_SINCE_DAYS value: %s", raw_since_days)
 
+    if raw_event_anchor:
+        try:
+            parsed_anchor = datetime.fromisoformat(raw_event_anchor.replace("Z", "+00:00"))
+            if parsed_anchor.tzinfo is None:
+                parsed_anchor = parsed_anchor.replace(tzinfo=timezone.utc)
+            search_event_anchor_utc = parsed_anchor.astimezone(timezone.utc)
+        except ValueError:
+            event_config_valid = False
+            log.warning("Ignoring invalid SEARCH_EVENT_ANCHOR_UTC value: %s", raw_event_anchor)
+
+    if raw_event_min:
+        try:
+            search_event_min_offset_minutes = max(0, int(raw_event_min))
+        except ValueError:
+            event_config_valid = False
+            log.warning(
+                "Ignoring invalid SEARCH_EVENT_MIN_OFFSET_MINUTES value: %s",
+                raw_event_min,
+            )
+
+    if raw_event_max:
+        try:
+            search_event_max_offset_minutes = max(1, int(raw_event_max))
+        except ValueError:
+            event_config_valid = False
+            log.warning(
+                "Ignoring invalid SEARCH_EVENT_MAX_OFFSET_MINUTES value: %s",
+                raw_event_max,
+            )
+
     discord_command_auth_mode = os.getenv("DISCORD_COMMAND_AUTH_MODE", "enforce").strip().lower()
     if discord_command_auth_mode not in {"audit", "enforce"}:
         discord_command_auth_mode = "enforce"
+
+    search_event_brands = parse_csv_env_list("SEARCH_EVENT_BRANDS")
+    if (
+        search_event_mode == "anchored"
+        and (
+            not event_config_valid
+            or not search_event_anchor_utc
+            or not search_event_brands
+            or search_event_max_offset_minutes < search_event_min_offset_minutes
+        )
+    ):
+        log.warning(
+            "SEARCH_EVENT_MODE=anchored is misconfigured; disabling anchored-event mode"
+        )
+        search_event_mode = "off"
+        search_event_anchor_utc = None
+        search_event_brands = []
 
     cfg = Config(
         # Filters
@@ -242,6 +307,11 @@ def load_config() -> Config:
         # Search provider
         search_provider=os.getenv("SEARCH_PROVIDER", "twitterapi_io").strip().lower(),
         search_since_days=search_since_days,
+        search_event_mode=search_event_mode,
+        search_event_anchor_utc=search_event_anchor_utc,
+        search_event_min_offset_minutes=search_event_min_offset_minutes,
+        search_event_max_offset_minutes=search_event_max_offset_minutes,
+        search_event_brands=search_event_brands,
         twitterapi_io_api_key=os.getenv("TWITTERAPI_IO_API_KEY", ""),
         brand_x_username=os.getenv("BRAND_X_USERNAME", "").lstrip("@"),
         # Rate limiting

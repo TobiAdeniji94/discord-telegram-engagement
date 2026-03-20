@@ -115,27 +115,27 @@ class TestBuildXSearchToolConfig:
         """Should build basic x_search config."""
         config = build_x_search_tool_config()
         assert config["type"] == "x_search"
-        assert config["x_search"]["enabled"] is True
+        assert "from_date" not in config
 
     def test_image_understanding(self):
         """Should include image understanding when enabled."""
         config = build_x_search_tool_config(enable_image_understanding=True)
-        assert config["x_search"]["image_understanding"] is True
+        assert config["enable_image_understanding"] is True
 
     def test_video_understanding(self):
         """Should include video understanding when enabled."""
         config = build_x_search_tool_config(enable_video_understanding=True)
-        assert config["x_search"]["video_understanding"] is True
+        assert config["enable_video_understanding"] is True
 
     def test_excluded_handles(self):
         """Should include excluded handles."""
         config = build_x_search_tool_config(excluded_handles=["user1", "user2"])
-        assert config["x_search"]["excluded_accounts"] == ["user1", "user2"]
+        assert config["excluded_x_handles"] == ["user1", "user2"]
 
     def test_allowed_handles(self):
         """Should include allowed handles."""
         config = build_x_search_tool_config(allowed_handles=["user1"])
-        assert config["x_search"]["accounts"] == ["user1"]
+        assert config["allowed_x_handles"] == ["user1"]
 
     def test_date_range(self):
         """Should include date range."""
@@ -143,8 +143,8 @@ class TestBuildXSearchToolConfig:
             start_date="2024-01-01",
             end_date="2024-01-31",
         )
-        assert config["x_search"]["start_date"] == "2024-01-01"
-        assert config["x_search"]["end_date"] == "2024-01-31"
+        assert config["from_date"] == "2024-01-01"
+        assert config["to_date"] == "2024-01-31"
 
 
 class TestNullSearchProvider:

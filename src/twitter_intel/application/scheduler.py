@@ -6,6 +6,7 @@ Manages the scan loop and stats loop for the Twitter Intelligence Bot.
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -50,6 +51,37 @@ class ScanScheduler:
         self._runtime = runtime
         self._running = False
 
+    def _initialize_restart_catchup(self) -> None:
+        """Set a one-cycle catch-up window when the bot has been offline."""
+        if self._runtime.restart_catchup_start_utc or self._runtime.restart_catchup_end_utc:
+            return
+
+        last_completed_raw = self._repository.get_runtime_value("last_scan_completed_at")
+        if not last_completed_raw:
+            return
+
+        try:
+            last_completed = datetime.fromisoformat(last_completed_raw.replace("Z", "+00:00"))
+            if last_completed.tzinfo is None:
+                last_completed = last_completed.replace(tzinfo=timezone.utc)
+            last_completed = last_completed.astimezone(timezone.utc)
+        except ValueError:
+            log.warning("Ignoring invalid stored last_scan_completed_at value: %s", last_completed_raw)
+            return
+
+        now_utc = datetime.now(timezone.utc)
+        downtime_seconds = max(0, (now_utc - last_completed).total_seconds())
+        if downtime_seconds <= max(60, self._config.poll_interval):
+            return
+
+        self._runtime.restart_catchup_start_utc = last_completed
+        self._runtime.restart_catchup_end_utc = now_utc
+        log.info(
+            "Restart catch-up active from %s to %s",
+            last_completed.isoformat(),
+            now_utc.isoformat(),
+        )
+
     async def run_scan_loop(self) -> None:
         """
         Run the main scan loop.
@@ -74,6 +106,8 @@ class ScanScheduler:
             while self._running:
                 await asyncio.sleep(60)
             return
+
+        self._initialize_restart_catchup()
 
         # Initial delay to let Discord gateway connect first
         await asyncio.sleep(5)
@@ -104,6 +138,13 @@ class ScanScheduler:
 
         # Update runtime stats
         self._runtime.scans_completed += 1
+        completed_at = datetime.now(timezone.utc).replace(microsecond=0)
+        self._repository.set_runtime_value(
+            "last_scan_completed_at",
+            completed_at.isoformat().replace("+00:00", "Z"),
+        )
+        self._runtime.restart_catchup_start_utc = None
+        self._runtime.restart_catchup_end_utc = None
 
     async def run_stats_loop(self, interval_hours: float = 6.0) -> None:
         """

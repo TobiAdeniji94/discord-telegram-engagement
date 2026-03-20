@@ -57,6 +57,29 @@ def parse_handle_env_list(name: str) -> list[str]:
     return handles
 
 
+def parse_csv_env_list(name: str, max_items: int = 100) -> list[str]:
+    """
+    Parse a generic comma-separated list from an environment variable.
+
+    Values are trimmed, lowercased, deduplicated, and capped.
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return []
+
+    values: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        value = part.strip().lower()
+        if not value or value in seen:
+            continue
+        values.append(value)
+        seen.add(value)
+        if len(values) >= max(1, max_items):
+            break
+    return values
+
+
 def parse_id_env_list(name: str, max_items: int = 100) -> list[str]:
     """
     Parse a comma-separated list of Discord snowflake IDs from an env var.
