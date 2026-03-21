@@ -50,6 +50,24 @@ from twitter_intel.infrastructure.search.xai_live_search import (
 log = logging.getLogger(__name__)
 
 
+def _describe_exception(exc: BaseException) -> str:
+    message = str(exc).strip()
+    request = getattr(exc, "request", None)
+    method = str(getattr(request, "method", "") or "").strip()
+    url = str(getattr(request, "url", "") or "").strip()
+
+    if message:
+        prefix = exc.__class__.__name__
+        if method and url:
+            return f"{prefix}: {message} ({method} {url})"
+        return f"{prefix}: {message}"
+
+    if method and url:
+        return f"{exc.__class__.__name__} while calling {method} {url}"
+
+    return exc.__class__.__name__
+
+
 @dataclass
 class ScanResult:
     """Result of a scan operation."""
@@ -402,8 +420,9 @@ class ScanAndNotifyUseCase:
                 notification_service=self._notification_service,
             )
         except Exception as exc:
-            log.error(f"xAI search failed: {exc}")
-            self._runtime.last_fetch_summary = f"error:{exc}"
+            detail = _describe_exception(exc)
+            log.error("xAI search failed: %s", detail)
+            self._runtime.last_fetch_summary = f"error:{detail}"
             return []
 
     def _is_official_lane_author(self, tweet: TweetCandidate, lane: Any | None) -> bool:
@@ -792,8 +811,9 @@ class ScanAndNotifyUseCase:
                 "twitterapi.io auth failed. Check TWITTERAPI_IO_API_KEY."
             )
         except Exception as exc:
-            log.error(f"Search failed: {exc}")
-            self._runtime.last_fetch_summary = f"error:{exc}"
+            detail = _describe_exception(exc)
+            log.error("Search failed: %s", detail)
+            self._runtime.last_fetch_summary = f"error:{detail}"
 
         return all_candidates
 

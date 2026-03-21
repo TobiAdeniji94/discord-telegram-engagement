@@ -31,6 +31,25 @@ from twitter_intel.infrastructure.search.xai_client import (
 )
 
 log = logging.getLogger(__name__)
+X_SNOWFLAKE_EPOCH_MS = 1288834974657
+
+
+def _describe_exception(exc: BaseException) -> str:
+    message = str(exc).strip()
+    request = getattr(exc, "request", None)
+    method = str(getattr(request, "method", "") or "").strip()
+    url = str(getattr(request, "url", "") or "").strip()
+
+    if message:
+        prefix = exc.__class__.__name__
+        if method and url:
+            return f"{prefix}: {message} ({method} {url})"
+        return f"{prefix}: {message}"
+
+    if method and url:
+        return f"{exc.__class__.__name__} while calling {method} {url}"
+
+    return exc.__class__.__name__
 
 
 async def fetch_candidates_from_xai_search(
@@ -132,7 +151,11 @@ async def fetch_candidates_from_xai_search(
             )
             return prepared_candidates
         except Exception as exc:
-            log.error("xAI search failed '%s': %s", job.query.description or job.query.query, exc)
+            log.error(
+                "xAI search failed '%s': %s",
+                job.query.description or job.query.query,
+                _describe_exception(exc),
+            )
 
     if not runtime.last_fetch_summary:
         runtime.last_fetch_summary = (
@@ -730,6 +753,8 @@ def parse_xai_candidates(
 
         created_at = _parse_datetime_value(item.get("created_at_iso"))
         if created_at is None:
+            created_at = _created_at_from_tweet_id(tweet_id)
+        if created_at is None:
             log.info(
                 "Discarded xAI candidate: missing or invalid created_at_iso (%s)",
                 tweet_url,
@@ -950,6 +975,17 @@ def _parse_datetime_value(raw_value: object) -> datetime | None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
     except Exception:
+        return None
+
+
+def _created_at_from_tweet_id(tweet_id: str) -> datetime | None:
+    try:
+        snowflake = int(str(tweet_id or "").strip())
+        if snowflake < (1 << 22):
+            return None
+        timestamp_ms = (snowflake >> 22) + X_SNOWFLAKE_EPOCH_MS
+        return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
         return None
 
 

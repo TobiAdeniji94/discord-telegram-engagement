@@ -163,6 +163,11 @@ class TestBuildXaiToolConfig:
 class TestParseXaiCandidates:
     """Tests for xAI candidate parsing."""
 
+    @staticmethod
+    def _tweet_id_for_datetime(dt: datetime) -> str:
+        twitter_epoch_ms = 1288834974657
+        return str((int(dt.timestamp() * 1000) - twitter_epoch_ms) << 22)
+
     def test_accepts_srs_json_without_replies(self):
         job = SearchJob(
             query=SearchQuery(
@@ -222,6 +227,37 @@ class TestParseXaiCandidates:
         assert candidates[0].tweet.author_username == "user"
         assert candidates[0].tweet.text == "My Grey transfer is still pending after 2 days."
         assert candidates[0].analysis["category"] == "competitor-complaints"
+
+    def test_derives_created_at_from_realistic_tweet_id_when_timestamp_missing(self):
+        job = SearchJob(
+            query=SearchQuery(
+                query="Find Grey complaints",
+                category_hint="competitor_complaint",
+                description="Grey complaints",
+                brand_family="grey",
+            ),
+            query_type="Latest",
+        )
+        created_at = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+        tweet_id = self._tweet_id_for_datetime(created_at)
+        response_text = json.dumps(
+            {
+                "candidates": [
+                    {
+                        "tweet_url": f"https://x.com/user/status/{tweet_id}",
+                        "tweet_text": "My Grey transfer is still pending after 2 days.",
+                        "author_username": "user",
+                        "category": "competitor_complaint",
+                    }
+                ]
+            }
+        )
+
+        candidates = parse_xai_candidates({}, response_text, job)
+
+        assert len(candidates) == 1
+        assert candidates[0].tweet.tweet_id == tweet_id
+        assert candidates[0].tweet.created_at == created_at
 
     def test_discards_candidate_without_created_at_iso(self):
         job = SearchJob(
