@@ -137,6 +137,14 @@ class TestBuildXSearchToolConfig:
         config = build_x_search_tool_config(allowed_handles=["user1"])
         assert config["allowed_x_handles"] == ["user1"]
 
+    def test_rejects_allowed_and_excluded_together(self):
+        """Should reject invalid mixed handle filters."""
+        with pytest.raises(ValueError):
+            build_x_search_tool_config(
+                excluded_handles=["user1"],
+                allowed_handles=["user2"],
+            )
+
     def test_date_range(self):
         """Should include date range."""
         config = build_x_search_tool_config(

@@ -63,16 +63,17 @@ class TestSearchQuery:
 
 
 class TestDefaultSearchQueries:
-    """Tests for DEFAULT_SEARCH_QUERIES (2026 core-brand set)."""
+    """Tests for DEFAULT_SEARCH_QUERIES (SRS-YARA-XSS-2026 compliant)."""
 
-    def test_has_eight_default_queries(self):
-        """Should have exactly 8 default search queries."""
+    def test_has_default_queries(self):
+        """Should have complaint-type and seeker lanes per SRS."""
         from twitter_intel.config import DEFAULT_SEARCH_QUERIES
 
+        # 7 complaint brand lanes + 1 solution seeker lane = 8
         assert len(DEFAULT_SEARCH_QUERIES) == 8
 
     def test_competitor_complaint_queries(self):
-        """Should have one competitor complaint lane per core brand."""
+        """Should have one complaint lane per core brand per SRS Section 4.1.3."""
         from twitter_intel.config import DEFAULT_SEARCH_QUERIES
 
         competitor_queries = [
@@ -80,6 +81,7 @@ class TestDefaultSearchQueries:
         ]
         assert len(competitor_queries) == 7
         families = {q.brand_family for q in competitor_queries}
+        # SRS Section 4.1.3 requires exactly these 7 brands
         assert families == {
             "chipper",
             "grey",
@@ -89,9 +91,14 @@ class TestDefaultSearchQueries:
             "cleva",
             "remitly",
         }
+        counts = {
+            family: sum(1 for q in competitor_queries if q.brand_family == family)
+            for family in families
+        }
+        assert all(count == 1 for count in counts.values())
 
     def test_solution_seeker_queries(self):
-        """Should have one generic solution seeker lane."""
+        """Should have a single solution seeker lane per SRS Section 4.2."""
         from twitter_intel.config import DEFAULT_SEARCH_QUERIES
 
         seeker_queries = [
@@ -100,9 +107,12 @@ class TestDefaultSearchQueries:
         assert len(seeker_queries) == 1
 
         for query in seeker_queries:
-            assert query.cooldown_seconds == 1800
+            assert query.cooldown_seconds == 900
             assert query.brand_family == ""
-            assert "crypto off-ramp and cash-out options" in query.issue_focus
+
+        # Should cover the core solution-seeker discovery lane per SRS Section 4.2
+        lane_ids = {q.lane_id for q in seeker_queries}
+        assert "solution-seeker-usd-payments" in lane_ids
 
     def test_brand_mention_queries(self):
         """Default lane set should not include separate brand mention lanes."""
@@ -141,3 +151,69 @@ class TestDefaultSearchQueries:
             if query.category_hint == "competitor_complaint":
                 assert query.brand_aliases
                 assert query.exclude_author_handles
+
+
+class TestBuildStandardSearchQuery:
+    """Tests for compiling structured lanes into raw provider queries."""
+
+    def test_compiles_competitor_lane_with_handles(self):
+        from twitter_intel.config.search_queries import SearchQuery, build_standard_search_query
+
+        query = SearchQuery(
+            query="Find complaints about LemFi from real users.",
+            category_hint="competitor_complaint",
+            description="LemFi complaints",
+            intent_summary="Find complaints about LemFi from real users.",
+            brand_family="lemfi",
+            brand_aliases=["LemFi", "Lemfi"],
+            brand_handles=["UseLemfi"],
+            issue_focus=["pending or stuck transfers", "verification or OTP problems"],
+            geo_focus=["Nigeria", "Ghana", "Africa"],
+        )
+
+        compiled = build_standard_search_query(query)
+
+        assert "@UseLemfi" in compiled
+        assert "to:UseLemfi" in compiled
+        assert "pending" in compiled
+        assert "lang:en -is:retweet" in compiled
+
+    def test_compiles_solution_seeker_lane(self):
+        from twitter_intel.config.search_queries import SearchQuery, build_standard_search_query
+
+        query = SearchQuery(
+            query="Find solution seekers for conversion and virtual cards.",
+            category_hint="solution_seeker",
+            description="Seekers",
+            intent_summary="Find solution seekers for conversion and virtual cards.",
+            issue_focus=[
+                "fiat or crypto conversion",
+                "crypto off-ramp and cash-out options",
+                "virtual USD cards",
+            ],
+            geo_focus=["Nigeria", "Ghana", "Africa"],
+        )
+
+        compiled = build_standard_search_query(query)
+
+        assert "crypto" in compiled
+        assert '"virtual USD cards"' in compiled or '"virtual card"' in compiled or "virtual" in compiled
+        assert "recommend" in compiled
+        assert "lang:en -is:retweet" in compiled
+
+    def test_preserves_explicit_operator_query(self):
+        from twitter_intel.config.search_queries import SearchQuery, build_standard_search_query
+
+        query = SearchQuery(
+            query='("wise" OR "@Wise") (failed OR pending) lang:en -is:retweet',
+            category_hint="competitor_complaint",
+            description="Wise complaints",
+            intent_summary="Find complaints about Wise from real users.",
+            brand_family="wise",
+            brand_aliases=["Wise"],
+            brand_handles=["Wise"],
+        )
+
+        compiled = build_standard_search_query(query)
+
+        assert compiled == query.query

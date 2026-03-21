@@ -17,7 +17,7 @@ class TestConfig:
         assert cfg.max_tweet_age_minutes == 120
         assert cfg.poll_interval == 900
         assert cfg.search_provider == "twitterapi_io"
-        assert cfg.max_api_requests_per_scan == 4
+        assert cfg.max_api_requests_per_scan == 8
         assert cfg.max_local_candidates_per_scan == 8
         assert cfg.max_ai_candidates_per_scan == 4
         assert cfg.max_discord_approvals_per_scan == 2
@@ -287,6 +287,8 @@ class TestSearchRuntime:
         assert runtime.stale_candidate_ids == set()
         assert runtime.restart_catchup_start_utc is None
         assert runtime.restart_catchup_end_utc is None
+        assert runtime.last_xss_due_jobs == []
+        assert runtime.last_xss_outputs == []
 
     def test_mutable_dict_fields_are_independent(self):
         """Each SearchRuntime instance should have independent dict fields."""

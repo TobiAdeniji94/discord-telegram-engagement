@@ -3,6 +3,12 @@ Scan and notify use case.
 
 Orchestrates the main scan pipeline: fetch candidates from search provider,
 score and filter locally, send to AI classifier, and queue for Discord review.
+
+Implements SRS-YARA-XSS-2026:
+- Section 4.3: Time-Window Filtering
+- Section 4.4: Candidate Scoring
+- Section 5.4: Post-Retrieval Filtering (FR-13 through FR-15)
+- Section 5.5: Scoring and Ranking (FR-16 through FR-18)
 """
 
 import asyncio
@@ -11,11 +17,17 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import Any, Optional
 
 from twitter_intel.config import Config, SearchRuntime
+from twitter_intel.config.search_queries import build_standard_search_query
+from twitter_intel.config.brand_registry import get_brand, BrandConfig
 from twitter_intel.domain.entities.category import TweetCategory
 from twitter_intel.domain.entities.tweet import PreparedReviewCandidate, TweetCandidate
+from twitter_intel.domain.entities.xss_output import (
+    XSSSearchCycleOutput,
+    create_search_cycle_output,
+)
 from twitter_intel.domain.interfaces import (
     AIClassifier,
     NotificationService,
@@ -28,9 +40,11 @@ from twitter_intel.domain.services import (
     format_discarded_candidates,
     score_candidate,
 )
+from twitter_intel.domain.services.scoring import score_candidate_xss, ScoringResult
 from twitter_intel.infrastructure.search.xai_client import XaiClient
 from twitter_intel.infrastructure.search.xai_live_search import (
     fetch_candidates_from_xai_search,
+    select_due_queries,
 )
 
 log = logging.getLogger(__name__)
@@ -98,12 +112,23 @@ class ScanAndNotifyUseCase:
         """
         Execute scan using xAI x_search provider.
 
-        xAI returns pre-classified candidates with replies.
+        xAI returns raw candidate references. Application code performs the
+        SRS-required filtering, scoring, ranking, and output emission locally.
         """
         prepared_candidates = await self._fetch_xai_candidates()
         self._runtime.tweets_fetched += len(prepared_candidates)
 
+        lane_lookup = {
+            getattr(query, "query", ""): query
+            for query in getattr(self._config, "search_queries", [])
+            if getattr(query, "query", "")
+        }
+        output_by_query = self._build_xss_output_map(lane_lookup)
+
         if not prepared_candidates:
+            self._runtime.last_xss_outputs = [
+                output.to_dict() for output in output_by_query.values()
+            ]
             self._log_no_candidates()
             return ScanResult(
                 queued_count=0,
@@ -112,40 +137,34 @@ class ScanAndNotifyUseCase:
                 message="No candidates from xAI x_search",
             )
 
-        # Track seen IDs and process candidates
-        seen_ids: set[str] = set()
-        queued_count = 0
+        seen_urls: set[str] = set()
         discarded: list[tuple[str, float, str]] = []
-        lane_lookup = {
-            getattr(query, "query", ""): query
-            for query in getattr(self._config, "search_queries", [])
-            if getattr(query, "query", "")
-        }
+        surviving_candidates: list[PreparedReviewCandidate] = []
 
         for prepared in prepared_candidates:
             tweet = prepared.tweet
             lane = lane_lookup.get(prepared.source_query)
+            output = self._get_or_create_xss_output(output_by_query, prepared.source_query, lane)
+            output.raw_result_count += 1
 
             # If xAI keeps resurfacing the same stale post, ignore it after
             # the first rejection so the status channel does not get spammed.
             if tweet.tweet_id in self._runtime.stale_candidate_ids:
                 continue
 
-            # Skip duplicates
-            if tweet.tweet_id in seen_ids:
+            dedupe_key = self._normalize_tweet_url(tweet.url) or tweet.tweet_id
+            if dedupe_key in seen_urls:
                 self._runtime.duplicates_dropped += 1
                 discarded.append((tweet.tweet_id, tweet.local_score, "duplicate_in_scan"))
                 continue
 
-            # Skip already processed
             if self._repository.is_processed(tweet.tweet_id):
                 self._runtime.duplicates_dropped += 1
                 discarded.append((tweet.tweet_id, tweet.local_score, "already_processed"))
                 continue
 
-            seen_ids.add(tweet.tweet_id)
+            seen_urls.add(dedupe_key)
 
-            # Enforce age cap parity with the standard provider flow
             if tweet.age_minutes > self._config.max_tweet_age_minutes:
                 self._runtime.locally_filtered_out += 1
                 self._runtime.stale_candidate_ids.add(tweet.tweet_id)
@@ -157,32 +176,76 @@ class ScanAndNotifyUseCase:
                 discarded.append((tweet.tweet_id, tweet.local_score, "official_author"))
                 continue
 
-            if self._is_outside_anchored_event_window(tweet, lane):
+            lower_bound, upper_bound = self._resolve_xss_filter_bounds(lane)
+            if self._is_outside_xss_time_window(tweet, lower_bound, upper_bound):
                 self._runtime.locally_filtered_out += 1
-                discarded.append((tweet.tweet_id, tweet.local_score, "outside_event_window"))
+                discarded.append(
+                    (tweet.tweet_id, tweet.local_score, self._xss_filter_reason(lane))
+                )
                 continue
 
-            if self._is_outside_restart_catchup_window(tweet):
+            score_value, score_reason, passes_threshold = self._score_xai_candidate(
+                prepared,
+                lane,
+            )
+            tweet.local_score = float(score_value)
+            prepared.analysis["score"] = score_value
+            prepared.analysis["reason"] = score_reason
+
+            if not passes_threshold:
                 self._runtime.locally_filtered_out += 1
-                discarded.append((tweet.tweet_id, tweet.local_score, "outside_restart_catchup"))
+                discarded.append((tweet.tweet_id, tweet.local_score, "below_xss_threshold"))
                 continue
 
-            # Check approval cap
-            if queued_count >= self._config.max_discord_approvals_per_scan:
-                self._runtime.locally_filtered_out += 1
-                discarded.append((tweet.tweet_id, tweet.local_score, "trimmed_by_cap"))
-                continue
+            surviving_candidates.append(prepared)
 
-            # Queue for review
-            if await self._queue_for_review(tweet, prepared.analysis):
+        surviving_candidates.sort(
+            key=lambda candidate: (
+                candidate.tweet.local_score,
+                candidate.tweet.created_at,
+            ),
+            reverse=True,
+        )
+
+        for prepared in surviving_candidates:
+            lane = lane_lookup.get(prepared.source_query)
+            output = self._get_or_create_xss_output(output_by_query, prepared.source_query, lane)
+            output.add_candidate(
+                tweet_url=prepared.tweet.url,
+                tweet_text=prepared.tweet.text,
+                author_username=prepared.tweet.author_username,
+                created_at=prepared.tweet.created_at,
+                category=self._xss_output_category(
+                    prepared.analysis.get("category"),
+                    lane,
+                ),
+                score=int(prepared.analysis.get("score", round(prepared.tweet.local_score))),
+                reason=str(prepared.analysis.get("reason") or "matched_lane").strip(),
+            )
+
+        for output in output_by_query.values():
+            output.filtered_result_count = len(output.candidates)
+        self._runtime.last_xss_outputs = [
+            output.to_dict() for output in output_by_query.values()
+        ]
+
+        queue_candidates = surviving_candidates[: self._config.max_discord_approvals_per_scan]
+        for prepared in surviving_candidates[self._config.max_discord_approvals_per_scan :]:
+            self._runtime.locally_filtered_out += 1
+            discarded.append((prepared.tweet.tweet_id, prepared.tweet.local_score, "trimmed_by_cap"))
+
+        queued_count = 0
+        for prepared in queue_candidates:
+            if await self._queue_for_review(prepared.tweet, prepared.analysis):
                 queued_count += 1
                 self._runtime.queued_to_discord += 1
 
             await asyncio.sleep(1)
 
         log.info(
-            "Grok prepared %s candidate(s), %s queued to Discord",
+            "Grok prepared %s candidate(s), %s survived local XSS filtering, %s queued to Discord",
             len(prepared_candidates),
+            len(surviving_candidates),
             queued_count,
         )
 
@@ -229,6 +292,30 @@ class ScanAndNotifyUseCase:
             self._config.max_tweet_age_minutes,
             processed_ids,
         )
+
+        lane_lookup = {
+            getattr(query, "query", ""): query
+            for query in getattr(self._config, "search_queries", [])
+            if getattr(query, "query", "")
+        }
+        lane_filtered_candidates: list[TweetCandidate] = []
+        for tweet in scored_candidates:
+            lane = lane_lookup.get(tweet.search_query)
+
+            if self._is_official_lane_author(tweet, lane):
+                discarded.append((tweet.tweet_id, tweet.local_score, "official_author"))
+                continue
+
+            if self._is_outside_anchored_event_window(tweet, lane):
+                discarded.append((tweet.tweet_id, tweet.local_score, "outside_event_window"))
+                continue
+
+            if self._is_outside_restart_catchup_window(tweet):
+                discarded.append((tweet.tweet_id, tweet.local_score, "outside_restart_catchup"))
+                continue
+
+            lane_filtered_candidates.append(tweet)
+        scored_candidates = lane_filtered_candidates
 
         # Update runtime stats
         for _, _, reason in discarded:
@@ -367,29 +454,315 @@ class ScanAndNotifyUseCase:
             return False
         return not (lower_bound <= tweet.created_at <= upper_bound)
 
+    def _compute_xss_time_window(
+        self,
+        restart_time_utc: Optional[datetime] = None,
+    ) -> tuple[Optional[datetime], Optional[datetime]]:
+        """
+        Compute SRS-compliant time-window bounds per Section 4.3.2.
+
+        The system shall:
+        - Accept a restart_time_utc parameter for each search cycle
+        - Compute lower_bound = restart_time_utc + window_start_offset (default: 30 min)
+        - Compute upper_bound = restart_time_utc + window_end_offset (default: 6 hours)
+
+        Args:
+            restart_time_utc: Server restart timestamp (uses catchup start if not provided)
+
+        Returns:
+            Tuple of (lower_bound, upper_bound) datetime objects, or (None, None)
+        """
+        anchor = restart_time_utc or getattr(
+            self._runtime, "restart_catchup_start_utc", None
+        )
+        if anchor is None:
+            return None, None
+
+        lower_bound = anchor + timedelta(
+            minutes=self._config.xss_window_start_offset_minutes
+        )
+        upper_bound = anchor + timedelta(
+            minutes=self._config.xss_window_end_offset_minutes
+        )
+        return lower_bound, upper_bound
+
+    def _is_outside_xss_time_window(
+        self,
+        tweet: TweetCandidate,
+        lower_bound: Optional[datetime] = None,
+        upper_bound: Optional[datetime] = None,
+    ) -> bool:
+        """
+        Check if tweet is outside the XSS time window per SRS FR-14.
+
+        The system shall parse created_at_iso timestamps as UTC datetime objects
+        and compare them against the computed lower_bound and upper_bound.
+
+        Args:
+            tweet: Tweet candidate to check
+            lower_bound: Time window lower bound
+            upper_bound: Time window upper bound
+
+        Returns:
+            True if tweet is outside the window
+        """
+        if lower_bound is None or upper_bound is None:
+            return False
+        return not (lower_bound <= tweet.created_at <= upper_bound)
+
+    @staticmethod
+    def _normalize_tweet_url(url: str) -> str:
+        normalized = str(url or "").strip().rstrip("/")
+        if not normalized:
+            return ""
+        return normalized.replace("https://twitter.com/", "https://x.com/")
+
+    def _resolve_xss_filter_bounds(
+        self,
+        lane: Any | None = None,
+    ) -> tuple[Optional[datetime], Optional[datetime]]:
+        if (
+            getattr(self._config, "search_event_mode", "off") == "anchored"
+            and getattr(self._config, "search_event_anchor_utc", None) is not None
+            and lane is not None
+        ):
+            brand_family = str(getattr(lane, "brand_family", "") or "").strip().lower()
+            event_brands = {
+                str(brand or "").strip().lower()
+                for brand in getattr(self._config, "search_event_brands", []) or []
+            }
+            if brand_family and brand_family in event_brands:
+                lower_bound = self._config.search_event_anchor_utc + timedelta(
+                    minutes=max(
+                        0,
+                        int(getattr(self._config, "search_event_min_offset_minutes", 30)),
+                    )
+                )
+                upper_bound = self._config.search_event_anchor_utc + timedelta(
+                    minutes=max(
+                        1,
+                        int(getattr(self._config, "search_event_max_offset_minutes", 360)),
+                    )
+                )
+                return lower_bound, upper_bound
+
+        lower_bound, upper_bound = self._compute_xss_time_window()
+        catchup_end = getattr(self._runtime, "restart_catchup_end_utc", None)
+        if lower_bound is not None and upper_bound is not None and catchup_end is not None:
+            upper_bound = min(upper_bound, catchup_end)
+        return lower_bound, upper_bound
+
+    def _xss_filter_reason(self, lane: Any | None = None) -> str:
+        lower_bound, upper_bound = self._resolve_xss_filter_bounds(lane)
+        if lower_bound is None or upper_bound is None:
+            return "outside_xss_window"
+        if (
+            getattr(self._config, "search_event_mode", "off") == "anchored"
+            and getattr(self._config, "search_event_anchor_utc", None) is not None
+        ):
+            return "outside_event_window"
+        return "outside_xss_window"
+
+    def _score_candidate_xss(
+        self,
+        tweet: TweetCandidate,
+        lane: Any | None = None,
+    ) -> ScoringResult:
+        """
+        Score a candidate using SRS Section 4.4.2 rubric.
+
+        Per SRS FR-16: Each candidate shall be scored using the rubric.
+        Per SRS FR-17: Candidates below minimum threshold (default: 5) shall be discarded.
+
+        Args:
+            tweet: Tweet candidate to score
+            lane: Search lane configuration for brand context
+
+        Returns:
+            ScoringResult with score and breakdown
+        """
+        brand_key = None
+        brand_config = None
+
+        if lane is not None:
+            brand_key = str(getattr(lane, "brand_family", "") or "").strip().lower()
+            if brand_key:
+                brand_config = get_brand(brand_key)
+
+        return score_candidate_xss(
+            tweet_text=tweet.text,
+            author_username=tweet.author_username,
+            brand_config=brand_config,
+            brand_key=brand_key,
+        )
+
+    def _passes_xss_score_threshold(self, scoring_result: ScoringResult) -> bool:
+        """
+        Check if score meets minimum threshold per SRS FR-17.
+
+        The system shall discard candidates with a score below the
+        configurable minimum threshold (default: 5).
+
+        Args:
+            scoring_result: Result from score_candidate_xss
+
+        Returns:
+            True if score meets or exceeds threshold
+        """
+        minimum_threshold = int(getattr(self._config, "xss_minimum_score_threshold", 5) or 5)
+        return scoring_result.total_score >= minimum_threshold
+
+    @staticmethod
+    def _coerce_analysis_score(analysis: dict[str, Any]) -> int | None:
+        raw_score = analysis.get("score")
+        try:
+            if raw_score is not None:
+                return int(round(float(raw_score)))
+        except (TypeError, ValueError):
+            pass
+
+        raw_confidence = analysis.get("confidence")
+        try:
+            if raw_confidence is not None:
+                confidence = min(1.0, max(0.0, float(raw_confidence)))
+                return int(round(confidence * 10))
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    def _score_xai_candidate(
+        self,
+        prepared: PreparedReviewCandidate,
+        lane: Any | None = None,
+    ) -> tuple[int, str, bool]:
+        lane_hint = str(
+            getattr(lane, "category_hint", "") or prepared.tweet.category_hint or ""
+        ).strip().lower()
+
+        if lane_hint == "competitor_complaint":
+            scoring_result = self._score_candidate_xss(prepared.tweet, lane)
+            return (
+                scoring_result.total_score,
+                scoring_result.reason or "no_signals",
+                self._passes_xss_score_threshold(scoring_result),
+            )
+
+        score_value = self._coerce_analysis_score(prepared.analysis)
+        if score_value is None:
+            score_value = 0
+        reason = str(prepared.analysis.get("reason") or "lane_match").strip() or "lane_match"
+        minimum_threshold = int(getattr(self._config, "xss_minimum_score_threshold", 5) or 5)
+        return score_value, reason, score_value >= minimum_threshold
+
+    @staticmethod
+    def _xss_output_lane_name(category_hint: str) -> str:
+        normalized = str(category_hint or "").strip().lower()
+        if normalized == "solution_seeker":
+            return "solution_seeker"
+        return "competitor_complaint"
+
+    def _xss_output_category(self, raw_category: Any, lane: Any | None = None) -> str:
+        normalized = str(raw_category or "").strip().lower().replace("_", "-")
+        if normalized in {"solution-seeker", "solution-seekers"}:
+            return "solution_seeker"
+        if normalized in {"competitor-complaint", "competitor-complaints"}:
+            return "competitor_complaint"
+
+        lane_hint = str(getattr(lane, "category_hint", "") or "").strip().lower()
+        return self._xss_output_lane_name(lane_hint)
+
+    def _build_xss_output_map(
+        self,
+        lane_lookup: dict[str, Any],
+    ) -> dict[str, XSSSearchCycleOutput]:
+        outputs: dict[str, XSSSearchCycleOutput] = {}
+        for job in getattr(self._runtime, "last_xss_due_jobs", []) or []:
+            query = getattr(getattr(job, "query", None), "query", "")
+            lane = lane_lookup.get(query) or getattr(job, "query", None)
+            outputs[query] = self._get_or_create_xss_output(outputs, query, lane)
+        return outputs
+
+    def _get_or_create_xss_output(
+        self,
+        outputs: dict[str, XSSSearchCycleOutput],
+        source_query: str,
+        lane: Any | None = None,
+    ) -> XSSSearchCycleOutput:
+        if source_query in outputs:
+            return outputs[source_query]
+
+        lower_bound, upper_bound = self._resolve_xss_filter_bounds(lane)
+        output = create_search_cycle_output(
+            lane=self._xss_output_lane_name(getattr(lane, "category_hint", "")),
+            brand_key=str(getattr(lane, "brand_family", "") or "").strip().lower() or None,
+            restart_time_utc=getattr(self._runtime, "restart_catchup_start_utc", None),
+            filter_lower_bound=lower_bound,
+            filter_upper_bound=upper_bound,
+        )
+        outputs[source_query] = output
+        return output
+
     async def _fetch_standard_candidates(self) -> list[TweetCandidate]:
         """Fetch candidates from standard search provider."""
         all_candidates: list[TweetCandidate] = []
         self._runtime.last_fetch_summary = ""
+        now_ts = time.time()
+
+        if self._runtime.provider_paused_until > now_ts:
+            wait_seconds = max(1, int(self._runtime.provider_paused_until - now_ts))
+            self._runtime.last_fetch_summary = f"provider_paused:{wait_seconds}"
+            log.warning(
+                "Skipping %s scan for %ss: %s",
+                self._config.search_provider,
+                wait_seconds,
+                self._runtime.provider_pause_reason or "provider paused",
+            )
+            return []
+
+        self._runtime.provider_paused_until = 0.0
+        self._runtime.provider_pause_reason = ""
+
+        request_budget = max(0, int(getattr(self._config, "max_api_requests_per_scan", 0) or 0))
+        due_jobs = select_due_queries(
+            self._config,
+            self._runtime,
+            request_budget,
+            brand_direct_enabled=False,
+        )
+        if not due_jobs:
+            self._runtime.last_fetch_summary = "no_due_queries"
+            return []
 
         try:
-            # Get search queries from config
-            for query_config in self._config.search_queries:
-                query = query_config.query
+            for job in due_jobs:
+                query_config = job.query
                 category_hint = query_config.category_hint
+                compiled_query = self._build_standard_provider_query(query_config)
+                self._runtime.last_query_run[query_config.query] = time.time()
 
                 results = await self._search_provider.search(
-                    query=query,
-                    query_type="Top",
+                    query=compiled_query,
+                    query_type=job.query_type,
                 )
 
                 self._runtime.api_requests_made += 1
                 tweets = self._coerce_tweet_list(results)
                 self._runtime.tweets_fetched += len(tweets)
+                if tweets:
+                    self._runtime.empty_scan_counts[query_config.query] = 0
+                else:
+                    self._runtime.empty_scan_counts[query_config.query] = (
+                        self._runtime.empty_scan_counts.get(query_config.query, 0) + 1
+                    )
 
                 # Parse into TweetCandidate objects
                 for tweet_data in tweets[:20]:
-                    candidate = self._parse_tweet(tweet_data, category_hint)
+                    candidate = self._parse_tweet(
+                        tweet_data,
+                        category_hint,
+                        search_query=query_config.query,
+                        source_tab=job.query_type,
+                    )
                     if candidate:
                         all_candidates.append(candidate)
 
@@ -424,6 +797,46 @@ class ScanAndNotifyUseCase:
 
         return all_candidates
 
+    def _build_standard_provider_query(self, query_config: Any) -> str:
+        query = build_standard_search_query(query_config)
+        if not query:
+            return query
+
+        lower_date, upper_date = self._resolve_standard_search_date_window()
+        extra_terms: list[str] = []
+
+        if lower_date and "since:" not in query and "since_time:" not in query:
+            extra_terms.append(f"since:{lower_date}")
+
+        if upper_date and "until:" not in query and "until_time:" not in query:
+            exclusive_upper = (
+                datetime.fromisoformat(upper_date).date() + timedelta(days=1)
+            ).isoformat()
+            extra_terms.append(f"until:{exclusive_upper}")
+
+        if not extra_terms:
+            return query
+        return f"{query} {' '.join(extra_terms)}"
+
+    def _resolve_standard_search_date_window(self) -> tuple[str | None, str | None]:
+        end_date = datetime.now(timezone.utc).date()
+        start_date = None
+
+        if getattr(self._config, "search_since_days", None) is not None:
+            start_date = end_date - timedelta(days=int(self._config.search_since_days))
+
+        catchup_start = getattr(self._runtime, "restart_catchup_start_utc", None)
+        catchup_end = getattr(self._runtime, "restart_catchup_end_utc", None)
+        if catchup_start:
+            catchup_start_date = catchup_start.astimezone(timezone.utc).date()
+            start_date = catchup_start_date if start_date is None else min(start_date, catchup_start_date)
+        if catchup_end:
+            end_date = max(end_date, catchup_end.astimezone(timezone.utc).date())
+
+        if start_date is None:
+            return None, None
+        return start_date.isoformat(), end_date.isoformat()
+
     @staticmethod
     def _coerce_tweet_list(results: dict[str, Any]) -> list[dict[str, Any]]:
         """Normalize provider responses into a flat tweet list."""
@@ -442,7 +855,12 @@ class ScanAndNotifyUseCase:
         return []
 
     def _parse_tweet(
-        self, tweet_data: dict[str, Any], category_hint: str
+        self,
+        tweet_data: dict[str, Any],
+        category_hint: str,
+        *,
+        search_query: str = "",
+        source_tab: str = "",
     ) -> TweetCandidate | None:
         """Parse raw tweet data into TweetCandidate."""
         try:
@@ -509,8 +927,18 @@ class ScanAndNotifyUseCase:
                 quotes=self._coerce_int(tweet_data.get("quotes") or tweet_data.get("quoteCount")),
                 views=self._coerce_int(tweet_data.get("views") or tweet_data.get("viewCount")),
                 age_minutes=age_minutes,
-                source_tab=str(tweet_data.get("source_tab") or tweet_data.get("sourceTab") or "Top"),
-                search_query=str(tweet_data.get("search_query") or tweet_data.get("query") or ""),
+                source_tab=str(
+                    tweet_data.get("source_tab")
+                    or tweet_data.get("sourceTab")
+                    or source_tab
+                    or "Top"
+                ),
+                search_query=str(
+                    tweet_data.get("search_query")
+                    or tweet_data.get("query")
+                    or search_query
+                    or ""
+                ),
                 category_hint=category_hint,
             )
         except Exception as exc:

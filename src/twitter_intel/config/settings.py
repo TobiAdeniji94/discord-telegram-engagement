@@ -60,6 +60,7 @@ class Config:
     Main configuration for the Twitter Intelligence Bot.
 
     All settings are loaded from environment variables via load_config().
+    Implements SRS-YARA-XSS-2026 configuration requirements.
     """
 
     # --- Search Queries ---
@@ -76,6 +77,12 @@ class Config:
     num_reply_options: int = 4
     poll_interval: int = 900  # 15 minutes
 
+    # --- XSS Time-Window Filtering (SRS Section 4.3) ---
+    # Time-window filtering is performed in application code per SRS FR-13
+    xss_window_start_offset_minutes: int = 30  # Default per SRS Section 4.3.2
+    xss_window_end_offset_minutes: int = 360  # Default 6 hours per SRS Section 4.3.2
+    xss_minimum_score_threshold: int = 5  # Default per SRS Section 4.4.3
+
     # --- Search Provider ---
     search_provider: str = "twitterapi_io"
     search_since_days: int | None = None
@@ -88,7 +95,7 @@ class Config:
     brand_x_username: str = ""
 
     # --- Rate Limiting ---
-    max_api_requests_per_scan: int = 4
+    max_api_requests_per_scan: int = 8
     max_local_candidates_per_scan: int = 8
     max_ai_candidates_per_scan: int = 4
     max_discord_approvals_per_scan: int = 2
@@ -204,6 +211,8 @@ class SearchRuntime:
     stale_candidate_ids: set[str] = field(default_factory=set)
     restart_catchup_start_utc: datetime | None = None
     restart_catchup_end_utc: datetime | None = None
+    last_xss_due_jobs: list[SearchJob] = field(default_factory=list)
+    last_xss_outputs: list[dict[str, object]] = field(default_factory=list)
 
 
 def load_config() -> Config:
@@ -304,6 +313,16 @@ def load_config() -> Config:
         min_likes_latest=int(os.getenv("MIN_LIKES_LATEST", "3")),
         num_reply_options=int(os.getenv("NUM_REPLY_OPTIONS", "4")),
         poll_interval=int(os.getenv("POLL_INTERVAL", "900")),
+        # XSS Time-Window Filtering (SRS Section 4.3)
+        xss_window_start_offset_minutes=int(
+            os.getenv("XSS_WINDOW_START_OFFSET_MINUTES", "30")
+        ),
+        xss_window_end_offset_minutes=int(
+            os.getenv("XSS_WINDOW_END_OFFSET_MINUTES", "360")
+        ),
+        xss_minimum_score_threshold=int(
+            os.getenv("XSS_MINIMUM_SCORE_THRESHOLD", "5")
+        ),
         # Search provider
         search_provider=os.getenv("SEARCH_PROVIDER", "twitterapi_io").strip().lower(),
         search_since_days=search_since_days,
@@ -315,7 +334,7 @@ def load_config() -> Config:
         twitterapi_io_api_key=os.getenv("TWITTERAPI_IO_API_KEY", ""),
         brand_x_username=os.getenv("BRAND_X_USERNAME", "").lstrip("@"),
         # Rate limiting
-        max_api_requests_per_scan=int(os.getenv("MAX_API_REQUESTS_PER_SCAN", "4")),
+        max_api_requests_per_scan=int(os.getenv("MAX_API_REQUESTS_PER_SCAN", "8")),
         max_local_candidates_per_scan=int(
             os.getenv("MAX_LOCAL_CANDIDATES_PER_SCAN", "8")
         ),

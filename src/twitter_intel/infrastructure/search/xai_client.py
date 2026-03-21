@@ -111,7 +111,6 @@ class XaiClient:
             "model": model,
             "input": [{"role": "user", "content": prompt}],
             "tools": [tool_config],
-            "include": ["no_inline_citations"],
             "max_turns": max(1, max_turns),
         }
 
@@ -183,6 +182,22 @@ def build_x_search_tool_config(
     Returns:
         Tool configuration dict for xAI API
     """
+    cleaned_excluded = [
+        str(handle or "").strip().lstrip("@")
+        for handle in (excluded_handles or [])
+        if str(handle or "").strip().lstrip("@")
+    ][:10]
+    cleaned_allowed = [
+        str(handle or "").strip().lstrip("@")
+        for handle in (allowed_handles or [])
+        if str(handle or "").strip().lstrip("@")
+    ][:10]
+
+    if cleaned_excluded and cleaned_allowed:
+        raise ValueError(
+            "x_search tool config cannot set allowed_x_handles and excluded_x_handles together"
+        )
+
     tool: dict[str, Any] = {"type": "x_search"}
 
     if enable_image_understanding:
@@ -190,10 +205,10 @@ def build_x_search_tool_config(
     if enable_video_understanding:
         tool["enable_video_understanding"] = True
 
-    if excluded_handles:
-        tool["excluded_x_handles"] = excluded_handles[:10]
-    if allowed_handles:
-        tool["allowed_x_handles"] = allowed_handles[:10]
+    if cleaned_excluded:
+        tool["excluded_x_handles"] = cleaned_excluded
+    if cleaned_allowed:
+        tool["allowed_x_handles"] = cleaned_allowed
 
     if start_date:
         tool["from_date"] = start_date

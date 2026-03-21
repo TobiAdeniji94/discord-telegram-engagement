@@ -193,6 +193,19 @@ class TestDiscordGatewayPendingBinding:
         message.reply.assert_called_once()
         assert "No pending approval" in message.reply.call_args[0][0]
 
+    async def test_custom_reply_accepts_pending_record_without_reply_options(self, gateway):
+        gateway._repository.get_pending = MagicMock(
+            return_value=([], "333", "222", "brand-mentions")
+        )
+        message = _build_message("!reply 123456 This is my reply")
+
+        await gateway._handle_custom_reply(message)
+
+        gateway._approve_use_case.execute_custom_reply.assert_called_once_with(
+            "123456", "This is my reply"
+        )
+        message.reply.assert_called_once_with("Custom reply posted!")
+
 
 class TestDiscordGatewayCommands:
     async def test_custom_reply_command_authorized(self, gateway):

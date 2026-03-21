@@ -5,6 +5,7 @@ This module provides:
 - Environment variable parsing utilities
 - Search query definitions
 - Main Config dataclass with all settings
+- Brand registry for XSS (SRS-YARA-XSS-2026)
 """
 
 from twitter_intel.config.env_utils import (
@@ -22,6 +23,16 @@ from twitter_intel.config.settings import (
     SearchJob,
     SearchRuntime,
     load_config,
+)
+from twitter_intel.config.brand_registry import (
+    BrandConfig,
+    BRAND_REGISTRY,
+    get_brand,
+    get_all_brands,
+    get_brand_keys,
+    get_all_excluded_handles,
+    ScoringWeights,
+    DEFAULT_SCORING_WEIGHTS,
 )
 
 __all__ = [
@@ -41,4 +52,13 @@ __all__ = [
     "SearchJob",
     "SearchRuntime",
     "load_config",
+    # Brand registry (SRS-YARA-XSS-2026)
+    "BrandConfig",
+    "BRAND_REGISTRY",
+    "get_brand",
+    "get_all_brands",
+    "get_brand_keys",
+    "get_all_excluded_handles",
+    "ScoringWeights",
+    "DEFAULT_SCORING_WEIGHTS",
 ]

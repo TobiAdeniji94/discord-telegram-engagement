@@ -195,7 +195,7 @@ class DiscordGateway:
             return None
 
         replies = pending[0]
-        if not isinstance(replies, list) or not replies:
+        if not isinstance(replies, list):
             return None
 
         return pending
