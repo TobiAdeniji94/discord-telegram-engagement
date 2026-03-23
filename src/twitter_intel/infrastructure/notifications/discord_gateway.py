@@ -10,6 +10,8 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    import discord
+
     from twitter_intel.application.use_cases import (
         ApproveTweetUseCase,
         ManualIngestUseCase,
@@ -20,6 +22,7 @@ if TYPE_CHECKING:
     from twitter_intel.domain.interfaces import TweetRepository
 
 from twitter_intel.domain.entities.category import parse_smoke_category
+from twitter_intel.infrastructure.search.xai_live_search import format_xai_telemetry_lines
 
 log = logging.getLogger(__name__)
 
@@ -496,14 +499,22 @@ class DiscordGateway:
         rejected_pct = (stats["rejected"] / total) * 100
         pending_pct = (stats["pending"] / total) * 100
 
-        await message.reply(
-            f"**Detailed Stats**\n"
-            f"Total Processed: {stats['total_processed']}\n"
-            f"Replied: {stats['replied']} ({replied_pct:.1f}%)\n"
-            f"Rejected: {stats['rejected']} ({rejected_pct:.1f}%)\n"
-            f"Pending: {stats['pending']} ({pending_pct:.1f}%)\n\n"
-            f"By Category:\n{cat_lines}"
-        )
+        message_lines = [
+            "**Detailed Stats**",
+            f"Total Processed: {stats['total_processed']}",
+            f"Replied: {stats['replied']} ({replied_pct:.1f}%)",
+            f"Rejected: {stats['rejected']} ({rejected_pct:.1f}%)",
+            f"Pending: {stats['pending']} ({pending_pct:.1f}%)",
+            "",
+            f"By Category:\n{cat_lines}",
+        ]
+
+        if self._runtime is not None:
+            xai_lines = format_xai_telemetry_lines(self._config, self._runtime)
+            if xai_lines:
+                message_lines.extend(["", *xai_lines])
+
+        await message.reply("\n".join(message_lines))
 
     async def _poll_interactions(self) -> None:
         """

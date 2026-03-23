@@ -60,6 +60,13 @@ def mock_config():
     config.discord_allowed_role_ids = []
     config.discord_allowed_channel_ids = ["222"]
     config.discord_require_pending_channel_match = True
+    config.search_provider = "twitterapi_io"
+    config.poll_interval = 300
+    config.max_api_requests_per_scan = 8
+    config.search_queries = []
+    config.xai_model = "grok-4.20-0309-reasoning"
+    config.xai_requests_per_minute_limit = None
+    config.xai_tokens_per_minute_limit = None
     return config
 
 
@@ -93,6 +100,13 @@ def mock_runtime():
     runtime.auth_denied_interactions = 0
     runtime.custom_reply_missing_pending = 0
     runtime.pending_channel_mismatch_denied = 0
+    runtime.xai_requests_made = 0
+    runtime.xai_http_attempts_made = 0
+    runtime.xai_x_search_tool_calls = 0
+    runtime.xai_rate_limit_hits = 0
+    runtime.xai_recent_usage_events = []
+    runtime.provider_paused_until = 0.0
+    runtime.provider_pause_reason = ""
     return runtime
 
 
@@ -225,3 +239,29 @@ class TestDiscordGatewayCommands:
 
         gateway._smoke_use_case.execute.assert_called_once_with(TweetCategory.BRAND_MENTION)
         message.reply.assert_called_once()
+
+    async def test_stats_command_includes_xai_telemetry(self, gateway):
+        gateway._config.search_provider = "xai_x_search"
+        gateway._config.search_queries = [MagicMock()]
+        gateway._runtime.xai_requests_made = 3
+        gateway._runtime.xai_http_attempts_made = 3
+        gateway._runtime.xai_x_search_tool_calls = 2
+        gateway._runtime.xai_recent_usage_events = [
+            {
+                "timestamp": 9999999999.0,
+                "http_attempts": 3,
+                "prompt_tokens": 50,
+                "prompt_text_tokens": 40,
+                "completion_tokens": 70,
+                "reasoning_tokens": 20,
+                "cached_prompt_tokens": 10,
+            }
+        ]
+        message = _build_message("!stats")
+
+        await gateway._handle_message(message)
+
+        reply_text = message.reply.call_args[0][0]
+        assert "xAI Telemetry" in reply_text
+        assert "Configured ceiling" in reply_text
+        assert "HTTP RPM" in reply_text

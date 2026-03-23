@@ -2,10 +2,11 @@
 Tests for ScanScheduler.
 """
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 import asyncio
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from twitter_intel.application.scheduler import ScanScheduler
 from twitter_intel.application.use_cases.scan_and_notify import ScanResult
@@ -132,6 +133,40 @@ class TestScanScheduler:
         assert "To Discord: 25" in call_args
         assert "Filtered: 50" in call_args
         assert "Dupes: 10" in call_args
+
+    async def test_post_stats_includes_xai_telemetry(
+        self,
+        scheduler,
+        mock_notification_service,
+        runtime,
+    ):
+        scheduler._config.search_provider = "xai_x_search"
+        scheduler._config.max_api_requests_per_scan = 8
+        scheduler._config.search_queries = []
+        scheduler._config.xai_model = "grok-4.20-0309-reasoning"
+        scheduler._config.xai_requests_per_minute_limit = 600
+        scheduler._config.xai_tokens_per_minute_limit = 3500000
+        runtime.xai_requests_made = 2
+        runtime.xai_http_attempts_made = 2
+        runtime.xai_recent_usage_events = [
+            {
+                "timestamp": 9999999999.0,
+                "http_attempts": 2,
+                "prompt_tokens": 20,
+                "prompt_text_tokens": 15,
+                "completion_tokens": 40,
+                "reasoning_tokens": 10,
+                "cached_prompt_tokens": 5,
+            }
+        ]
+
+        await scheduler._post_stats()
+
+        call_args = mock_notification_service.send_status.call_args[0][0]
+
+        assert "xAI:" in call_args
+        assert "HTTP RPM" in call_args
+        assert "limits RPM" in call_args
 
     async def test_stop_scheduler(self, scheduler):
         """Should stop when stop is called."""

@@ -151,6 +151,9 @@ Useful search controls:
 - `XAI_MODEL`
 - `XAI_MAX_TURNS`
 - `XAI_REQUEST_TIMEOUT_SECONDS`
+- `XAI_ENABLE_PROMPT_CACHING`
+- `XAI_REQUESTS_PER_MINUTE_LIMIT`
+- `XAI_TOKENS_PER_MINUTE_LIMIT`
 
 ## Run With Docker
 
@@ -259,6 +262,7 @@ Use:
 ```env
 SEARCH_PROVIDER=xai_x_search
 XAI_API_KEY=...
+XAI_MODEL=grok-4.20-0309-reasoning
 ```
 
 Notes:
@@ -266,6 +270,8 @@ Notes:
 - Grok uses xAI's server-side `x_search` tool, not a raw tweet API.
 - The bot validates every `tweet_url` against xAI citations before queueing it.
 - `GEMINI_API_KEY` is not required in this mode.
+- The preferred pinned default is `grok-4.20-0309-reasoning`. If your team does not have access to that exact model id, use the supported alias shown in xAI Console, such as `grok-4.20-reasoning`.
+- Team RPM/TPM limits are team-specific. If you want `% of limit used` in `!stats`, copy your limits from xAI Console into `XAI_REQUESTS_PER_MINUTE_LIMIT` and `XAI_TOKENS_PER_MINUTE_LIMIT`.
 
 For lower rate-limit pressure, start with:
 
@@ -273,11 +279,13 @@ For lower rate-limit pressure, start with:
 POLL_INTERVAL=300
 MAX_API_REQUESTS_PER_SCAN=1
 SEARCH_SINCE_DAYS=0
+XAI_MAX_TURNS=1
 ```
 
 ## Rate Limiting
 
 The bot now backs off on `twitterapi.io` `429` responses and respects `Retry-After` if the provider returns it.
+For `xai_x_search`, the bot tracks rolling bot-local xAI telemetry, including HTTP-attempt RPM, TPM, cached prompt tokens, and the configured logical RPM ceiling derived from the current lane inventory and poll interval.
 
 To reduce rate-limit pressure:
 
@@ -286,6 +294,8 @@ To reduce rate-limit pressure:
 - increase per-query `cooldown_seconds`
 - keep `SEARCH_SINCE_DAYS` narrow
 - avoid overly broad competitor queries
+- lower `XAI_MAX_TURNS`
+- enable prompt caching with `XAI_ENABLE_PROMPT_CACHING=true`
 
 ## Troubleshooting
 
@@ -314,8 +324,11 @@ Reduce request volume:
 ```env
 POLL_INTERVAL=300
 MAX_API_REQUESTS_PER_SCAN=1
-XAI_MAX_TURNS=2
+XAI_MAX_TURNS=1
+XAI_ENABLE_PROMPT_CACHING=true
 ```
+
+If you set `XAI_REQUESTS_PER_MINUTE_LIMIT` and `XAI_TOKENS_PER_MINUTE_LIMIT`, `!stats` will also show your rolling xAI usage as a percentage of those team limits.
 
 ### `twitterapi.io rate limited`
 

@@ -2,7 +2,6 @@
 Pytest configuration and fixtures for Twitter Intelligence Bot tests.
 """
 
-import os
 import sys
 from pathlib import Path
 
@@ -48,6 +47,12 @@ def clean_env(monkeypatch):
         "XAI_MODEL",
         "XAI_MAX_TURNS",
         "XAI_REQUEST_TIMEOUT_SECONDS",
+        "XAI_ENABLE_PROMPT_CACHING",
+        "XAI_PROMPT_CACHE_NAMESPACE",
+        "XAI_REQUESTS_PER_MINUTE_LIMIT",
+        "XAI_TOKENS_PER_MINUTE_LIMIT",
+        "XAI_MAX_RETRIES",
+        "XAI_BACKOFF_BASE_SECONDS",
         "XAI_EXCLUDED_X_HANDLES",
         "XAI_ALLOWED_X_HANDLES",
         "XAI_ENABLE_IMAGE_UNDERSTANDING",

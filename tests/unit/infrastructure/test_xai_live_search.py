@@ -3,14 +3,19 @@ Tests for xAI live search prompt construction and lane scheduling.
 """
 
 import json
+import time
 from datetime import datetime, timezone
 
 from twitter_intel.config import Config, SearchJob, SearchQuery, SearchRuntime
 from twitter_intel.infrastructure.search.xai_live_search import (
-    build_xai_tool_config_for_job,
+    _update_xai_usage_counters,
     build_manual_grok_prompt,
     build_xai_search_prompt,
+    build_xai_telemetry_snapshot,
+    build_xai_tool_config_for_job,
+    configured_xai_logical_rpm_ceiling,
     parse_xai_candidates,
+    record_xai_http_attempt,
     select_due_queries,
 )
 
@@ -97,7 +102,6 @@ class TestBuildXaiSearchPrompt:
         assert "@Wise" in prompt
         assert "Return strict JSON with a candidates array." in prompt
 
- 
 class TestBuildXaiToolConfig:
     """Tests for per-lane x_search tool config construction."""
 
@@ -468,3 +472,57 @@ class TestSelectDueQueries:
             "complaint-wise-delay",
             "seekers-transfers",
         ]
+
+
+class TestXaiTelemetry:
+    def test_configured_logical_rpm_ceiling_uses_default_lane_inventory(self):
+        config = Config(
+            search_provider="xai_x_search",
+            poll_interval=300,
+            max_api_requests_per_scan=8,
+        )
+
+        rpm = configured_xai_logical_rpm_ceiling(config)
+
+        assert rpm == 1.6
+
+    def test_usage_snapshot_tracks_http_attempts_and_token_breakdown(self):
+        config = Config(
+            search_provider="xai_x_search",
+            poll_interval=300,
+            max_api_requests_per_scan=8,
+            xai_requests_per_minute_limit=600,
+            xai_tokens_per_minute_limit=3500000,
+        )
+        runtime = SearchRuntime()
+        now_ts = time.time()
+
+        record_xai_http_attempt(runtime, timestamp=now_ts - 20.0)
+        record_xai_http_attempt(runtime, timestamp=now_ts)
+        _update_xai_usage_counters(
+            runtime,
+            {
+                "usage": {
+                    "prompt_tokens": 50,
+                    "completion_tokens": 80,
+                    "prompt_tokens_details": {
+                        "text_tokens": 40,
+                        "cached_tokens": 10,
+                    },
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 30,
+                    },
+                }
+            },
+        )
+
+        snapshot = build_xai_telemetry_snapshot(config, runtime, now_ts=now_ts)
+
+        assert snapshot["http_attempt_rpm"] == 2.0
+        assert snapshot["actual_tpm"] == 160
+        assert snapshot["prompt_tpm"] == 50
+        assert snapshot["completion_tpm"] == 80
+        assert snapshot["reasoning_tpm"] == 30
+        assert snapshot["cached_tpm"] == 10
+        assert snapshot["cache_hit_pct"] == 20.0
+        assert snapshot["configured_logical_rpm"] == 1.6

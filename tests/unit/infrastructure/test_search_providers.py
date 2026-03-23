@@ -2,23 +2,19 @@
 Unit tests for search provider infrastructure.
 """
 
-import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import pytest
+
+from twitter_intel.domain.interfaces import SearchProvider
+from twitter_intel.exceptions import ConfigurationError
 from twitter_intel.infrastructure.search import (
+    NullSearchProvider,
+    SearchProviderFactory,
     TwitterApiIoClient,
     XaiClient,
-    SearchProviderFactory,
-    NullSearchProvider,
     build_x_search_tool_config,
-)
-from twitter_intel.domain.interfaces import SearchProvider
-from twitter_intel.exceptions import (
-    TwitterApiIoAuthError,
-    TwitterApiIoRateLimitError,
-    XaiAuthError,
-    XaiRateLimitError,
-    ConfigurationError,
 )
 
 
@@ -96,6 +92,134 @@ class TestXaiClient:
         """Client should accept custom timeout."""
         client = XaiClient("test_key", timeout_seconds=60)
         assert client._timeout_seconds == 60
+
+    @pytest.mark.asyncio
+    async def test_prompt_caching_adds_deterministic_conversation_header(self):
+        request_headers: list[dict[str, str]] = []
+
+        class FakeAsyncClient:
+            def __init__(self, **kwargs):
+                request_headers.append(dict(kwargs["headers"]))
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, path, json):
+                request = httpx.Request("POST", "https://api.x.ai/v1/responses")
+                return httpx.Response(200, json={"output_text": "ok"}, request=request)
+
+        client = XaiClient("test_key", enable_prompt_caching=True)
+        with patch("twitter_intel.infrastructure.search.xai_client.httpx.AsyncClient", FakeAsyncClient):
+            await client.create_response(
+                model="grok-4.20-reasoning",
+                prompt="hello",
+                tool_config={"type": "x_search"},
+                max_turns=1,
+                cache_key="lane-one",
+            )
+            await client.create_response(
+                model="grok-4.20-reasoning",
+                prompt="hello again",
+                tool_config={"type": "x_search"},
+                max_turns=1,
+                cache_key="lane-one",
+            )
+
+        assert request_headers[0]["x-grok-conv-id"] == request_headers[1]["x-grok-conv-id"]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_supported_alias_when_primary_model_invalid(self):
+        requested_models: list[str] = []
+
+        class FakeAsyncClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, path, json):
+                requested_models.append(json["model"])
+                request = httpx.Request("POST", "https://api.x.ai/v1/responses")
+                if len(requested_models) == 1:
+                    return httpx.Response(
+                        400,
+                        json={"error": {"message": "Invalid model requested"}},
+                        request=request,
+                    )
+                return httpx.Response(200, json={"output_text": "ok"}, request=request)
+
+        client = XaiClient(
+            "test_key",
+            primary_default_model="grok-4.20-0309-reasoning",
+            fallback_model="grok-4.20-reasoning",
+        )
+        with patch("twitter_intel.infrastructure.search.xai_client.httpx.AsyncClient", FakeAsyncClient):
+            result = await client.create_response(
+                model="grok-4.20-0309-reasoning",
+                prompt="hello",
+                tool_config={"type": "x_search"},
+                max_turns=1,
+            )
+
+        assert result == {"output_text": "ok"}
+        assert requested_models == [
+            "grok-4.20-0309-reasoning",
+            "grok-4.20-reasoning",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_request_error_retries_and_invokes_attempt_callback(self):
+        attempts = 0
+        callback_count = 0
+
+        class FakeAsyncClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, path, json):
+                nonlocal attempts
+                attempts += 1
+                request = httpx.Request("POST", "https://api.x.ai/v1/responses")
+                if attempts == 1:
+                    raise httpx.ReadTimeout("timed out", request=request)
+                return httpx.Response(200, json={"output_text": "ok"}, request=request)
+
+        async def fake_sleep(delay):
+            return None
+
+        def on_request_attempt() -> None:
+            nonlocal callback_count
+            callback_count += 1
+
+        client = XaiClient("test_key", max_retries=2, backoff_base_seconds=0.1)
+        with (
+            patch("twitter_intel.infrastructure.search.xai_client.httpx.AsyncClient", FakeAsyncClient),
+            patch("twitter_intel.infrastructure.search.xai_client.asyncio.sleep", fake_sleep),
+        ):
+            result = await client.create_response(
+                model="grok-4.20-reasoning",
+                prompt="hello",
+                tool_config={"type": "x_search"},
+                max_turns=1,
+                on_request_attempt=on_request_attempt,
+            )
+
+        assert result == {"output_text": "ok"}
+        assert attempts == 2
+        assert callback_count == 2
 
     def test_parse_retry_after_seconds_integer(self):
         """Should parse integer retry-after value."""

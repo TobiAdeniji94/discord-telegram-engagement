@@ -7,7 +7,16 @@ Provides centralized dependency management for the application.
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from twitter_intel.application.scheduler import ScanScheduler
+from twitter_intel.application.use_cases import (
+    ApproveTweetUseCase,
+    ManualIngestUseCase,
+    RejectTweetUseCase,
+    ScanAndNotifyUseCase,
+    SmokeTestUseCase,
+)
 from twitter_intel.config import Config, SearchRuntime
+from twitter_intel.config.settings import DEFAULT_XAI_MODEL, DEFAULT_XAI_MODEL_FALLBACK
 from twitter_intel.domain.interfaces import (
     AIClassifier,
     NotificationService,
@@ -19,14 +28,6 @@ from twitter_intel.infrastructure.database import SqliteTweetRepository
 from twitter_intel.infrastructure.notifications import DiscordBot, DiscordGateway, TelegramNotifier
 from twitter_intel.infrastructure.search import SearchProviderFactory, XaiClient
 from twitter_intel.infrastructure.twitter import XPoster
-from twitter_intel.application.use_cases import (
-    ApproveTweetUseCase,
-    ManualIngestUseCase,
-    RejectTweetUseCase,
-    ScanAndNotifyUseCase,
-    SmokeTestUseCase,
-)
-from twitter_intel.application.scheduler import ScanScheduler
 
 if TYPE_CHECKING:
     pass
@@ -104,6 +105,12 @@ class Container:
             xai_client = XaiClient(
                 api_key=config.xai_api_key,
                 timeout_seconds=config.xai_request_timeout_seconds,
+                enable_prompt_caching=config.xai_enable_prompt_caching,
+                prompt_cache_namespace=config.xai_prompt_cache_namespace,
+                max_retries=config.xai_max_retries,
+                backoff_base_seconds=config.xai_backoff_base_seconds,
+                primary_default_model=DEFAULT_XAI_MODEL,
+                fallback_model=DEFAULT_XAI_MODEL_FALLBACK,
             )
 
         # Create X poster

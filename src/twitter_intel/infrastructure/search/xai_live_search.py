@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Optional
 
-from twitter_intel.config import Config, SearchJob, SearchRuntime, SearchQuery
+from twitter_intel.config import Config, SearchJob, SearchQuery, SearchRuntime
 from twitter_intel.config.brand_registry import BrandConfig, get_brand
 from twitter_intel.domain.entities.category import TweetCategory
 from twitter_intel.domain.entities.tweet import PreparedReviewCandidate, TweetCandidate
@@ -32,6 +32,7 @@ from twitter_intel.infrastructure.search.xai_client import (
 
 log = logging.getLogger(__name__)
 X_SNOWFLAKE_EPOCH_MS = 1288834974657
+XAI_USAGE_WINDOW_SECONDS = 60
 
 
 def _describe_exception(exc: BaseException) -> str:
@@ -50,6 +51,256 @@ def _describe_exception(exc: BaseException) -> str:
         return f"{exc.__class__.__name__} while calling {method} {url}"
 
     return exc.__class__.__name__
+
+
+def _coerce_int(value: object, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            return int(float(value.strip()))
+        return default
+    except (TypeError, ValueError):
+        return default
+
+
+def _prune_xai_usage_events(
+    runtime: SearchRuntime,
+    now_ts: float | None = None,
+    window_seconds: int = XAI_USAGE_WINDOW_SECONDS,
+) -> None:
+    cutoff = float(now_ts if now_ts is not None else time.time()) - max(1, window_seconds)
+    events = getattr(runtime, "xai_recent_usage_events", None)
+    if not isinstance(events, list):
+        runtime.xai_recent_usage_events = []
+        return
+    runtime.xai_recent_usage_events = [
+        event
+        for event in events
+        if isinstance(event, dict) and float(event.get("timestamp", 0.0) or 0.0) >= cutoff
+    ]
+
+
+def _append_xai_usage_event(
+    runtime: SearchRuntime,
+    *,
+    timestamp: float | None = None,
+    http_attempts: int = 0,
+    prompt_tokens: int = 0,
+    prompt_text_tokens: int = 0,
+    completion_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    cached_prompt_tokens: int = 0,
+) -> None:
+    now_ts = float(timestamp if timestamp is not None else time.time())
+    events = getattr(runtime, "xai_recent_usage_events", None)
+    if not isinstance(events, list):
+        runtime.xai_recent_usage_events = []
+        events = runtime.xai_recent_usage_events
+
+    events.append(
+        {
+            "timestamp": now_ts,
+            "http_attempts": max(0, int(http_attempts)),
+            "prompt_tokens": max(0, int(prompt_tokens)),
+            "prompt_text_tokens": max(0, int(prompt_text_tokens)),
+            "completion_tokens": max(0, int(completion_tokens)),
+            "reasoning_tokens": max(0, int(reasoning_tokens)),
+            "cached_prompt_tokens": max(0, int(cached_prompt_tokens)),
+        }
+    )
+    _prune_xai_usage_events(runtime, now_ts)
+
+
+def record_xai_http_attempt(runtime: SearchRuntime, timestamp: float | None = None) -> None:
+    runtime.xai_http_attempts_made = _coerce_int(
+        getattr(runtime, "xai_http_attempts_made", 0)
+    ) + 1
+    _append_xai_usage_event(runtime, timestamp=timestamp, http_attempts=1)
+
+
+def configured_xai_requests_per_scan(config: Config) -> int:
+    request_budget = max(0, _coerce_int(getattr(config, "max_api_requests_per_scan", 0)))
+    if request_budget <= 0:
+        return 0
+    try:
+        jobs = select_due_queries(
+            config,
+            SearchRuntime(),
+            request_budget,
+            brand_direct_enabled=False,
+        )
+        return len(jobs)
+    except Exception:
+        return request_budget
+
+
+def configured_xai_logical_rpm_ceiling(config: Config) -> float:
+    poll_interval = max(1, _coerce_int(getattr(config, "poll_interval", 0), 1))
+    requests_per_scan = configured_xai_requests_per_scan(config)
+    return requests_per_scan * (60.0 / poll_interval)
+
+
+def build_xai_telemetry_snapshot(
+    config: Config,
+    runtime: SearchRuntime,
+    *,
+    window_seconds: int = XAI_USAGE_WINDOW_SECONDS,
+    now_ts: float | None = None,
+) -> dict[str, object]:
+    current_ts = float(now_ts if now_ts is not None else time.time())
+    _prune_xai_usage_events(runtime, current_ts, window_seconds)
+    events = getattr(runtime, "xai_recent_usage_events", [])
+
+    http_attempts = 0
+    prompt_tokens = 0
+    prompt_text_tokens = 0
+    completion_tokens = 0
+    reasoning_tokens = 0
+    cached_prompt_tokens = 0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        http_attempts += _coerce_int(event.get("http_attempts"))
+        prompt_tokens += _coerce_int(event.get("prompt_tokens"))
+        prompt_text_tokens += _coerce_int(event.get("prompt_text_tokens"))
+        completion_tokens += _coerce_int(event.get("completion_tokens"))
+        reasoning_tokens += _coerce_int(event.get("reasoning_tokens"))
+        cached_prompt_tokens += _coerce_int(event.get("cached_prompt_tokens"))
+
+    actual_tpm = prompt_tokens + completion_tokens + reasoning_tokens
+    actual_rpm = http_attempts * (60.0 / max(1, window_seconds))
+    configured_requests = configured_xai_requests_per_scan(config)
+    configured_rpm = configured_xai_logical_rpm_ceiling(config)
+
+    cache_denominator = prompt_text_tokens + cached_prompt_tokens
+    cache_hit_pct = (
+        (cached_prompt_tokens / cache_denominator) * 100.0
+        if cache_denominator > 0
+        else None
+    )
+
+    pause_remaining_seconds = max(
+        0,
+        int(float(getattr(runtime, "provider_paused_until", 0.0) or 0.0) - current_ts),
+    )
+    rpm_limit_value = _coerce_int(getattr(config, "xai_requests_per_minute_limit", None), 0)
+    tpm_limit_value = _coerce_int(getattr(config, "xai_tokens_per_minute_limit", None), 0)
+    raw_model = getattr(config, "xai_model", "")
+    model_name = raw_model.strip() if isinstance(raw_model, str) and raw_model.strip() else "xai_x_search"
+
+    return {
+        "should_render": bool(
+            str(getattr(config, "search_provider", "")).strip().lower() == "xai_x_search"
+            or _coerce_int(getattr(runtime, "xai_requests_made", 0)) > 0
+            or _coerce_int(getattr(runtime, "xai_http_attempts_made", 0)) > 0
+            or rpm_limit_value > 0
+            or tpm_limit_value > 0
+        ),
+        "model": model_name,
+        "window_seconds": max(1, window_seconds),
+        "configured_requests_per_scan": configured_requests,
+        "configured_logical_rpm": configured_rpm,
+        "http_attempt_rpm": actual_rpm,
+        "actual_tpm": actual_tpm,
+        "prompt_tpm": prompt_tokens,
+        "completion_tpm": completion_tokens,
+        "reasoning_tpm": reasoning_tokens,
+        "cached_tpm": cached_prompt_tokens,
+        "cache_hit_pct": cache_hit_pct,
+        "total_http_attempts": _coerce_int(getattr(runtime, "xai_http_attempts_made", 0)),
+        "total_logical_requests": _coerce_int(getattr(runtime, "xai_requests_made", 0)),
+        "total_x_search_calls": _coerce_int(getattr(runtime, "xai_x_search_tool_calls", 0)),
+        "rate_limit_hits": _coerce_int(getattr(runtime, "xai_rate_limit_hits", 0)),
+        "pause_remaining_seconds": pause_remaining_seconds,
+        "pause_reason": str(getattr(runtime, "provider_pause_reason", "") or "").strip(),
+        "rpm_limit": rpm_limit_value or None,
+        "tpm_limit": tpm_limit_value or None,
+    }
+
+
+def format_xai_telemetry_lines(
+    config: Config,
+    runtime: SearchRuntime,
+    *,
+    compact: bool = False,
+) -> list[str]:
+    snapshot = build_xai_telemetry_snapshot(config, runtime)
+    if not bool(snapshot.get("should_render")):
+        return []
+
+    cache_hit_pct = snapshot.get("cache_hit_pct")
+    cache_text = "n/a" if cache_hit_pct is None else f"{float(cache_hit_pct):.1f}%"
+    pause_remaining = _coerce_int(snapshot.get("pause_remaining_seconds"))
+    pause_reason = str(snapshot.get("pause_reason") or "").strip()
+    pause_text = "none"
+    if pause_remaining > 0:
+        pause_text = f"{pause_remaining}s ({pause_reason or 'provider paused'})"
+
+    limit_bits: list[str] = []
+    rpm_limit = snapshot.get("rpm_limit")
+    if rpm_limit is not None:
+        rpm_value = float(snapshot.get("http_attempt_rpm") or 0.0)
+        limit_bits.append(
+            f"RPM {rpm_value:.2f}/{int(rpm_limit)} ({(rpm_value / max(1, int(rpm_limit))) * 100:.1f}%)"
+        )
+    tpm_limit = snapshot.get("tpm_limit")
+    if tpm_limit is not None:
+        tpm_value = _coerce_int(snapshot.get("actual_tpm"))
+        limit_bits.append(
+            f"TPM {tpm_value}/{int(tpm_limit)} ({(tpm_value / max(1, int(tpm_limit))) * 100:.1f}%)"
+        )
+
+    if compact:
+        line = (
+            f"xAI: {float(snapshot.get('http_attempt_rpm') or 0.0):.2f} HTTP RPM | "
+            f"{_coerce_int(snapshot.get('actual_tpm'))} TPM | "
+            f"cache {cache_text} | "
+            f"ceiling {float(snapshot.get('configured_logical_rpm') or 0.0):.2f} logical RPM | "
+            f"pause {pause_text}"
+        )
+        if limit_bits:
+            line += " | limits " + ", ".join(limit_bits)
+        return [line]
+
+    lines = [
+        "**xAI Telemetry**",
+        f"Model: {snapshot['model']}",
+        (
+            "Configured ceiling: "
+            f"{_coerce_int(snapshot.get('configured_requests_per_scan'))} req/scan | "
+            f"{float(snapshot.get('configured_logical_rpm') or 0.0):.2f} logical RPM"
+        ),
+        (
+            f"Last {snapshot['window_seconds']}s: "
+            f"{float(snapshot.get('http_attempt_rpm') or 0.0):.2f} HTTP RPM | "
+            f"{_coerce_int(snapshot.get('actual_tpm'))} TPM"
+        ),
+        (
+            f"Tokens ({snapshot['window_seconds']}s): "
+            f"prompt {_coerce_int(snapshot.get('prompt_tpm'))} | "
+            f"completion {_coerce_int(snapshot.get('completion_tpm'))} | "
+            f"reasoning {_coerce_int(snapshot.get('reasoning_tpm'))} | "
+            f"cached {_coerce_int(snapshot.get('cached_tpm'))}"
+        ),
+        (
+            f"Cache hit: {cache_text} | "
+            f"HTTP attempts total: {_coerce_int(snapshot.get('total_http_attempts'))} | "
+            f"logical requests total: {_coerce_int(snapshot.get('total_logical_requests'))} | "
+            f"x_search calls total: {_coerce_int(snapshot.get('total_x_search_calls'))}"
+        ),
+        (
+            f"Rate limits hit: {_coerce_int(snapshot.get('rate_limit_hits'))} | "
+            f"Provider pause: {pause_text}"
+        ),
+    ]
+    if limit_bits:
+        lines.append("Configured team limits: " + " | ".join(limit_bits))
+    return lines
 
 
 async def fetch_candidates_from_xai_search(
@@ -123,6 +374,8 @@ async def fetch_candidates_from_xai_search(
                 prompt=prompt,
                 tool_config=tool_config,
                 max_turns=config.xai_max_turns,
+                cache_key=job.query.lane_id or job.query.query,
+                on_request_attempt=lambda: record_xai_http_attempt(runtime),
             )
             tool_names = _update_xai_usage_counters(runtime, payload)
             if config.xai_debug_log_tool_calls and tool_names:
@@ -138,6 +391,7 @@ async def fetch_candidates_from_xai_search(
             await _pause_provider("xAI auth failed. Check XAI_API_KEY before the next scan.")
             return prepared_candidates
         except XaiRateLimitError as exc:
+            runtime.xai_rate_limit_hits = _coerce_int(getattr(runtime, "xai_rate_limit_hits", 0)) + 1
             log.warning(
                 "%s%s",
                 str(exc),
@@ -1211,18 +1465,49 @@ def _update_xai_usage_counters(
         usage = nested.get("usage")
 
     if isinstance(usage, dict):
-        for key, attr in (
-            ("prompt_tokens", "xai_prompt_tokens"),
-            ("input_tokens", "xai_prompt_tokens"),
-            ("completion_tokens", "xai_completion_tokens"),
-            ("output_tokens", "xai_completion_tokens"),
-            ("reasoning_tokens", "xai_reasoning_tokens"),
-            ("cost_usd_ticks", "xai_cost_usd_ticks"),
-            ("estimated_cost_usd_ticks", "xai_cost_usd_ticks"),
-        ):
+        prompt_tokens = _coerce_int(
+            usage.get("prompt_tokens", usage.get("input_tokens")),
+        )
+        completion_tokens = _coerce_int(
+            usage.get("completion_tokens", usage.get("output_tokens")),
+        )
+        prompt_details = usage.get("prompt_tokens_details")
+        prompt_text_tokens = prompt_tokens
+        cached_prompt_tokens = 0
+        if isinstance(prompt_details, dict):
+            prompt_text_tokens = _coerce_int(
+                prompt_details.get("text_tokens"),
+                prompt_tokens,
+            )
+            cached_prompt_tokens = _coerce_int(prompt_details.get("cached_tokens"))
+
+        completion_details = usage.get("completion_tokens_details")
+        reasoning_tokens = _coerce_int(usage.get("reasoning_tokens"))
+        if isinstance(completion_details, dict):
+            reasoning_tokens = _coerce_int(
+                completion_details.get("reasoning_tokens"),
+                reasoning_tokens,
+            )
+
+        runtime.xai_prompt_tokens += prompt_tokens
+        runtime.xai_prompt_text_tokens += prompt_text_tokens
+        runtime.xai_cached_prompt_tokens += cached_prompt_tokens
+        runtime.xai_completion_tokens += completion_tokens
+        runtime.xai_reasoning_tokens += reasoning_tokens
+
+        for key in ("cost_usd_ticks", "estimated_cost_usd_ticks"):
             value = usage.get(key)
             if isinstance(value, (int, float)):
-                setattr(runtime, attr, getattr(runtime, attr) + int(value))
+                runtime.xai_cost_usd_ticks += int(value)
+
+        _append_xai_usage_event(
+            runtime,
+            prompt_tokens=prompt_tokens,
+            prompt_text_tokens=prompt_text_tokens,
+            completion_tokens=completion_tokens,
+            reasoning_tokens=reasoning_tokens,
+            cached_prompt_tokens=cached_prompt_tokens,
+        )
 
     tool_names = _collect_tool_call_names(payload)
     x_search_calls = _collect_server_side_x_search_calls(payload)

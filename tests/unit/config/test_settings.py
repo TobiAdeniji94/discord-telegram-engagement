@@ -3,7 +3,6 @@ Tests for twitter_intel.config.settings module.
 """
 
 import json
-import pytest
 
 
 class TestConfig:
@@ -22,7 +21,13 @@ class TestConfig:
         assert cfg.max_ai_candidates_per_scan == 4
         assert cfg.max_discord_approvals_per_scan == 2
         assert cfg.gemini_model == "gemini-2.0-flash"
-        assert cfg.xai_model == "grok-4-1-fast-reasoning"
+        assert cfg.xai_model == "grok-4.20-0309-reasoning"
+        assert cfg.xai_enable_prompt_caching is True
+        assert cfg.xai_prompt_cache_namespace == "discord-telegram-engagement"
+        assert cfg.xai_requests_per_minute_limit is None
+        assert cfg.xai_tokens_per_minute_limit is None
+        assert cfg.xai_max_retries == 3
+        assert cfg.xai_backoff_base_seconds == 1.0
         assert cfg.discord_command_auth_mode == "enforce"
         assert cfg.discord_allowed_user_ids == []
         assert cfg.discord_allowed_role_ids == []
@@ -71,6 +76,12 @@ class TestLoadConfig:
         clean_env.setenv("SEARCH_PROVIDER", "xai_x_search")
         clean_env.setenv("DISCORD_BOT_TOKEN", "my_token")
         clean_env.setenv("GEMINI_API_KEY", "gemini_key")
+        clean_env.setenv("XAI_ENABLE_PROMPT_CACHING", "false")
+        clean_env.setenv("XAI_PROMPT_CACHE_NAMESPACE", "prod-bot")
+        clean_env.setenv("XAI_REQUESTS_PER_MINUTE_LIMIT", "600")
+        clean_env.setenv("XAI_TOKENS_PER_MINUTE_LIMIT", "3500000")
+        clean_env.setenv("XAI_MAX_RETRIES", "5")
+        clean_env.setenv("XAI_BACKOFF_BASE_SECONDS", "2.5")
 
         cfg = load_config()
         assert cfg.max_tweet_age_minutes == 60
@@ -78,6 +89,12 @@ class TestLoadConfig:
         assert cfg.search_provider == "xai_x_search"
         assert cfg.discord_bot_token == "my_token"
         assert cfg.gemini_api_key == "gemini_key"
+        assert cfg.xai_enable_prompt_caching is False
+        assert cfg.xai_prompt_cache_namespace == "prod-bot"
+        assert cfg.xai_requests_per_minute_limit == 600
+        assert cfg.xai_tokens_per_minute_limit == 3500000
+        assert cfg.xai_max_retries == 5
+        assert cfg.xai_backoff_base_seconds == 2.5
 
     def test_loads_boolean_env_vars(self, clean_env):
         """load_config should parse boolean env vars correctly."""
@@ -284,6 +301,11 @@ class TestSearchRuntime:
         assert runtime.provider_paused_until == 0.0
         assert runtime.last_query_run == {}
         assert runtime.empty_scan_counts == {}
+        assert runtime.xai_http_attempts_made == 0
+        assert runtime.xai_prompt_text_tokens == 0
+        assert runtime.xai_cached_prompt_tokens == 0
+        assert runtime.xai_rate_limit_hits == 0
+        assert runtime.xai_recent_usage_events == []
         assert runtime.stale_candidate_ids == set()
         assert runtime.restart_catchup_start_utc is None
         assert runtime.restart_catchup_end_utc is None

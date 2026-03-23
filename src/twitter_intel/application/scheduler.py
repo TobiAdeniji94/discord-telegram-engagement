@@ -9,6 +9,8 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from twitter_intel.infrastructure.search.xai_live_search import format_xai_telemetry_lines
+
 if TYPE_CHECKING:
     from twitter_intel.application.use_cases import ScanAndNotifyUseCase
     from twitter_intel.config import Config, SearchRuntime
@@ -201,6 +203,10 @@ class ScanScheduler:
             f"Categories: {cat_summary}\n"
             f"Runtime: {runtime_stats}"
         )
+
+        xai_lines = format_xai_telemetry_lines(self._config, self._runtime, compact=True)
+        if xai_lines:
+            message += "\n" + "\n".join(xai_lines)
 
         await self._notification_service.send_status(message)
         log.info("Posted periodic stats update")

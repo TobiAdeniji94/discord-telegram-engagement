@@ -19,10 +19,11 @@ from twitter_intel.config.env_utils import (
     resolve_db_path,
     resolve_twscrape_db_path,
 )
-from twitter_intel.config.search_queries import SearchQuery, DEFAULT_SEARCH_QUERIES
-
+from twitter_intel.config.search_queries import DEFAULT_SEARCH_QUERIES, SearchQuery
 
 log = logging.getLogger("twitter_intel.config")
+DEFAULT_XAI_MODEL = "grok-4.20-0309-reasoning"
+DEFAULT_XAI_MODEL_FALLBACK = "grok-4.20-reasoning"
 
 
 # Default brand context for AI classification and reply generation
@@ -107,9 +108,15 @@ class Config:
 
     # --- xAI / Grok ---
     xai_api_key: str = ""
-    xai_model: str = "grok-4-1-fast-reasoning"
+    xai_model: str = DEFAULT_XAI_MODEL
     xai_max_turns: int = 2
     xai_request_timeout_seconds: int = 30
+    xai_enable_prompt_caching: bool = True
+    xai_prompt_cache_namespace: str = "discord-telegram-engagement"
+    xai_requests_per_minute_limit: int | None = None
+    xai_tokens_per_minute_limit: int | None = None
+    xai_max_retries: int = 3
+    xai_backoff_base_seconds: float = 1.0
     xai_excluded_x_handles: list[str] = field(default_factory=list)
     xai_allowed_x_handles: list[str] = field(default_factory=list)
     xai_enable_image_understanding: bool = False
@@ -199,11 +206,16 @@ class SearchRuntime:
 
     # xAI-specific metrics
     xai_requests_made: int = 0
+    xai_http_attempts_made: int = 0
     xai_x_search_tool_calls: int = 0
     xai_prompt_tokens: int = 0
+    xai_prompt_text_tokens: int = 0
+    xai_cached_prompt_tokens: int = 0
     xai_completion_tokens: int = 0
     xai_reasoning_tokens: int = 0
     xai_cost_usd_ticks: int = 0
+    xai_rate_limit_hits: int = 0
+    xai_recent_usage_events: list[dict[str, float | int]] = field(default_factory=list)
     auth_denied_commands: int = 0
     auth_denied_interactions: int = 0
     custom_reply_missing_pending: int = 0
@@ -304,6 +316,26 @@ def load_config() -> Config:
         search_event_anchor_utc = None
         search_event_brands = []
 
+    def _optional_int_env(name: str) -> int | None:
+        raw_value = os.getenv(name, "").strip()
+        if not raw_value:
+            return None
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            log.warning("Ignoring invalid %s value: %s", name, raw_value)
+            return None
+
+    def _float_env(name: str, default: float) -> float:
+        raw_value = os.getenv(name, "").strip()
+        if not raw_value:
+            return default
+        try:
+            return float(raw_value)
+        except ValueError:
+            log.warning("Ignoring invalid %s value: %s", name, raw_value)
+            return default
+
     cfg = Config(
         # Filters
         max_tweet_age_minutes=int(os.getenv("MAX_TWEET_AGE_MINUTES", "120")),
@@ -347,11 +379,23 @@ def load_config() -> Config:
         debug_discarded_to_status=env_flag("DEBUG_DISCARDED_TO_STATUS"),
         # xAI
         xai_api_key=os.getenv("XAI_API_KEY", ""),
-        xai_model=os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning"),
+        xai_model=os.getenv("XAI_MODEL", DEFAULT_XAI_MODEL),
         xai_max_turns=max(1, int(os.getenv("XAI_MAX_TURNS", "2"))),
         xai_request_timeout_seconds=max(
             5,
             int(os.getenv("XAI_REQUEST_TIMEOUT_SECONDS", "30")),
+        ),
+        xai_enable_prompt_caching=env_flag("XAI_ENABLE_PROMPT_CACHING", "true"),
+        xai_prompt_cache_namespace=(
+            os.getenv("XAI_PROMPT_CACHE_NAMESPACE", "discord-telegram-engagement").strip()
+            or "discord-telegram-engagement"
+        ),
+        xai_requests_per_minute_limit=_optional_int_env("XAI_REQUESTS_PER_MINUTE_LIMIT"),
+        xai_tokens_per_minute_limit=_optional_int_env("XAI_TOKENS_PER_MINUTE_LIMIT"),
+        xai_max_retries=max(0, int(os.getenv("XAI_MAX_RETRIES", "3"))),
+        xai_backoff_base_seconds=max(
+            0.1,
+            _float_env("XAI_BACKOFF_BASE_SECONDS", 1.0),
         ),
         xai_excluded_x_handles=parse_handle_env_list("XAI_EXCLUDED_X_HANDLES"),
         xai_allowed_x_handles=parse_handle_env_list("XAI_ALLOWED_X_HANDLES"),
