@@ -146,6 +146,10 @@ class TestScanScheduler:
         scheduler._config.xai_model = "grok-4.20-0309-reasoning"
         scheduler._config.xai_requests_per_minute_limit = 600
         scheduler._config.xai_tokens_per_minute_limit = 3500000
+        runtime.provider_paused_until = 1893456000.0
+        runtime.provider_pause_reason = (
+            "xAI rate limited the bot. Search is paused until the retry window."
+        )
         runtime.xai_requests_made = 2
         runtime.xai_http_attempts_made = 2
         runtime.xai_recent_usage_events = [
@@ -167,6 +171,7 @@ class TestScanScheduler:
         assert "xAI:" in call_args
         assert "HTTP RPM" in call_args
         assert "limits RPM" in call_args
+        assert "2030-01-01T00:00:00Z" in call_args
 
     async def test_stop_scheduler(self, scheduler):
         """Should stop when stop is called."""

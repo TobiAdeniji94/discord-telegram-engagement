@@ -44,7 +44,10 @@ from twitter_intel.domain.services.scoring import score_candidate_xss, ScoringRe
 from twitter_intel.infrastructure.search.xai_client import XaiClient
 from twitter_intel.infrastructure.search.xai_live_search import (
     fetch_candidates_from_xai_search,
+    format_utc_timestamp,
+    format_provider_pause_text,
     select_due_queries,
+    with_resume_utc,
 )
 
 log = logging.getLogger(__name__)
@@ -731,10 +734,9 @@ class ScanAndNotifyUseCase:
             wait_seconds = max(1, int(self._runtime.provider_paused_until - now_ts))
             self._runtime.last_fetch_summary = f"provider_paused:{wait_seconds}"
             log.warning(
-                "Skipping %s scan for %ss: %s",
+                "Skipping %s scan: %s",
                 self._config.search_provider,
-                wait_seconds,
-                self._runtime.provider_pause_reason or "provider paused",
+                format_provider_pause_text(self._runtime, now_ts=now_ts),
             )
             return []
 
@@ -794,15 +796,20 @@ class ScanAndNotifyUseCase:
 
         except TwitterApiIoRateLimitError as exc:
             pause_seconds = max(1, exc.retry_after_seconds or self._config.poll_interval)
-            self._runtime.provider_paused_until = time.time() + pause_seconds
+            resume_at_ts = time.time() + pause_seconds
+            self._runtime.provider_paused_until = resume_at_ts
             self._runtime.provider_pause_reason = "twitterapi.io rate limited"
             self._runtime.last_fetch_summary = f"provider_paused:{pause_seconds}"
             log.warning(
-                "Pausing twitterapi.io provider for %ss after rate limit",
+                "Pausing twitterapi.io provider for %ss until %s after rate limit",
                 pause_seconds,
+                format_utc_timestamp(resume_at_ts) or "unknown",
             )
             await self._notification_service.send_status(
-                "twitterapi.io rate limited the bot. Search is paused until the retry window."
+                with_resume_utc(
+                    "twitterapi.io rate limited the bot. Search is paused until the retry window.",
+                    resume_at_ts,
+                )
             )
         except TwitterApiIoAuthError as exc:
             self._runtime.last_fetch_summary = f"error:{exc}"
@@ -1077,7 +1084,7 @@ class ScanAndNotifyUseCase:
         if summary == "no_due_queries":
             log.info("No live-search queries were due this scan")
         elif summary.startswith("provider_paused:"):
-            log.info("Live search is paused: %s", self._runtime.provider_pause_reason)
+            log.info("Live search is paused: %s", format_provider_pause_text(self._runtime))
         elif summary == "zero_provider_results":
             log.info("%s queries ran but returned 0 candidates", self._config.search_provider)
         else:

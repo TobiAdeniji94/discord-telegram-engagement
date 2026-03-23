@@ -68,6 +68,56 @@ def _coerce_int(value: object, default: int = 0) -> int:
         return default
 
 
+def format_utc_timestamp(timestamp: float | None) -> str | None:
+    try:
+        value = float(timestamp or 0.0)
+    except (TypeError, ValueError):
+        return None
+
+    if value <= 0:
+        return None
+
+    return (
+        datetime.fromtimestamp(value, tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def with_resume_utc(message: str, resume_at_ts: float | None) -> str:
+    resume_at_utc = format_utc_timestamp(resume_at_ts)
+    if not resume_at_utc:
+        return message
+
+    base_message = message.rstrip()
+    if base_message.endswith("."):
+        return f"{base_message} Resume no earlier than {resume_at_utc}."
+    return f"{base_message}. Resume no earlier than {resume_at_utc}."
+
+
+def format_provider_pause_text(
+    runtime: SearchRuntime,
+    *,
+    now_ts: float | None = None,
+) -> str:
+    current_ts = float(now_ts if now_ts is not None else time.time())
+    pause_until_ts = float(getattr(runtime, "provider_paused_until", 0.0) or 0.0)
+    if pause_until_ts <= current_ts:
+        return "none"
+
+    pause_remaining_seconds = max(1, int(pause_until_ts - current_ts))
+    pause_reason = str(getattr(runtime, "provider_pause_reason", "") or "").strip()
+    resume_at_utc = format_utc_timestamp(pause_until_ts)
+
+    if resume_at_utc:
+        return (
+            f"{pause_remaining_seconds}s until {resume_at_utc} "
+            f"({pause_reason or 'provider paused'})"
+        )
+    return f"{pause_remaining_seconds}s ({pause_reason or 'provider paused'})"
+
+
 def _prune_xai_usage_events(
     runtime: SearchRuntime,
     now_ts: float | None = None,
@@ -184,10 +234,10 @@ def build_xai_telemetry_snapshot(
         else None
     )
 
-    pause_remaining_seconds = max(
-        0,
-        int(float(getattr(runtime, "provider_paused_until", 0.0) or 0.0) - current_ts),
-    )
+    pause_until_ts = float(getattr(runtime, "provider_paused_until", 0.0) or 0.0)
+    pause_remaining_seconds = 0
+    if pause_until_ts > current_ts:
+        pause_remaining_seconds = max(1, int(pause_until_ts - current_ts))
     rpm_limit_value = _coerce_int(getattr(config, "xai_requests_per_minute_limit", None), 0)
     tpm_limit_value = _coerce_int(getattr(config, "xai_tokens_per_minute_limit", None), 0)
     raw_model = getattr(config, "xai_model", "")
@@ -217,6 +267,9 @@ def build_xai_telemetry_snapshot(
         "total_x_search_calls": _coerce_int(getattr(runtime, "xai_x_search_tool_calls", 0)),
         "rate_limit_hits": _coerce_int(getattr(runtime, "xai_rate_limit_hits", 0)),
         "pause_remaining_seconds": pause_remaining_seconds,
+        "pause_resume_at_utc": format_utc_timestamp(pause_until_ts)
+        if pause_remaining_seconds > 0
+        else None,
         "pause_reason": str(getattr(runtime, "provider_pause_reason", "") or "").strip(),
         "rpm_limit": rpm_limit_value or None,
         "tpm_limit": tpm_limit_value or None,
@@ -237,9 +290,16 @@ def format_xai_telemetry_lines(
     cache_text = "n/a" if cache_hit_pct is None else f"{float(cache_hit_pct):.1f}%"
     pause_remaining = _coerce_int(snapshot.get("pause_remaining_seconds"))
     pause_reason = str(snapshot.get("pause_reason") or "").strip()
+    pause_resume_at_utc = str(snapshot.get("pause_resume_at_utc") or "").strip()
     pause_text = "none"
     if pause_remaining > 0:
-        pause_text = f"{pause_remaining}s ({pause_reason or 'provider paused'})"
+        if pause_resume_at_utc:
+            pause_text = (
+                f"{pause_remaining}s until {pause_resume_at_utc} "
+                f"({pause_reason or 'provider paused'})"
+            )
+        else:
+            pause_text = f"{pause_remaining}s ({pause_reason or 'provider paused'})"
 
     limit_bits: list[str] = []
     rpm_limit = snapshot.get("rpm_limit")
@@ -323,11 +383,7 @@ async def fetch_candidates_from_xai_search(
     if runtime.provider_paused_until > now_ts:
         wait_seconds = max(1, int(runtime.provider_paused_until - now_ts))
         runtime.last_fetch_summary = f"provider_paused:{wait_seconds}"
-        log.warning(
-            "Skipping xAI scan for %ss: %s",
-            wait_seconds,
-            runtime.provider_pause_reason or "provider paused",
-        )
+        log.warning("Skipping xAI scan: %s", format_provider_pause_text(runtime, now_ts=now_ts))
         return []
 
     runtime.provider_paused_until = 0.0
@@ -350,10 +406,18 @@ async def fetch_candidates_from_xai_search(
 
     async def _pause_provider(reason: str, pause_seconds: int | None = None) -> None:
         actual_pause_seconds = max(1, pause_seconds or config.poll_interval)
-        runtime.provider_paused_until = time.time() + actual_pause_seconds
+        resume_at_ts = time.time() + actual_pause_seconds
+        runtime.provider_paused_until = resume_at_ts
         runtime.provider_pause_reason = reason
         runtime.last_fetch_summary = f"provider_paused:{actual_pause_seconds}"
-        await notification_service.send_status(reason)
+        resume_at_utc = format_utc_timestamp(resume_at_ts) or "unknown"
+        log.warning(
+            "Pausing xAI provider for %ss until %s: %s",
+            actual_pause_seconds,
+            resume_at_utc,
+            reason,
+        )
+        await notification_service.send_status(with_resume_utc(reason, resume_at_ts))
 
     for job in due_jobs:
         if remaining_budget <= 0:

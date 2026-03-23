@@ -5,8 +5,10 @@ Tests for xAI live search prompt construction and lane scheduling.
 import json
 import time
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 from twitter_intel.config import Config, SearchJob, SearchQuery, SearchRuntime
+from twitter_intel.exceptions import XaiRateLimitError
 from twitter_intel.infrastructure.search.xai_live_search import (
     _update_xai_usage_counters,
     build_manual_grok_prompt,
@@ -14,6 +16,7 @@ from twitter_intel.infrastructure.search.xai_live_search import (
     build_xai_telemetry_snapshot,
     build_xai_tool_config_for_job,
     configured_xai_logical_rpm_ceiling,
+    fetch_candidates_from_xai_search,
     parse_xai_candidates,
     record_xai_http_attempt,
     select_due_queries,
@@ -496,6 +499,10 @@ class TestXaiTelemetry:
         )
         runtime = SearchRuntime()
         now_ts = time.time()
+        expected_resume_at = datetime.fromtimestamp(now_ts + 125, tz=timezone.utc)
+        expected_resume_text = expected_resume_at.replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
 
         record_xai_http_attempt(runtime, timestamp=now_ts - 20.0)
         record_xai_http_attempt(runtime, timestamp=now_ts)
@@ -515,6 +522,8 @@ class TestXaiTelemetry:
                 }
             },
         )
+        runtime.provider_paused_until = now_ts + 125
+        runtime.provider_pause_reason = "xAI rate limited the bot. Search is paused until the retry window."
 
         snapshot = build_xai_telemetry_snapshot(config, runtime, now_ts=now_ts)
 
@@ -526,3 +535,59 @@ class TestXaiTelemetry:
         assert snapshot["cached_tpm"] == 10
         assert snapshot["cache_hit_pct"] == 20.0
         assert snapshot["configured_logical_rpm"] == 1.6
+        assert snapshot["pause_remaining_seconds"] == 125
+        assert snapshot["pause_resume_at_utc"] == expected_resume_text
+
+    async def test_xai_rate_limit_notification_includes_exact_resume_utc(self, monkeypatch):
+        config = Config(
+            search_provider="xai_x_search",
+            poll_interval=600,
+            max_api_requests_per_scan=1,
+            search_queries=[
+                SearchQuery(
+                    query="Find Grey complaints",
+                    category_hint="competitor_complaint",
+                    description="Grey complaints",
+                    query_type="Latest",
+                    cooldown_seconds=60,
+                    lane_id="complaint-grey",
+                    intent_summary="Find Grey complaints from real users.",
+                    brand_family="grey",
+                )
+            ],
+        )
+        runtime = SearchRuntime()
+        notification_service = MagicMock()
+        notification_service.send_status = AsyncMock()
+        client = MagicMock()
+        client.create_response = AsyncMock(
+            side_effect=XaiRateLimitError(
+                "xAI rate limited",
+                retry_after_seconds=120,
+            )
+        )
+        base_ts = 1760000000.0
+        expected_resume_text = (
+            datetime.fromtimestamp(base_ts + 120, tz=timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+        monkeypatch.setattr(
+            "twitter_intel.infrastructure.search.xai_live_search.time.time",
+            lambda: base_ts,
+        )
+
+        candidates = await fetch_candidates_from_xai_search(
+            config,
+            client,
+            runtime,
+            notification_service,
+        )
+
+        assert candidates == []
+        assert runtime.last_fetch_summary == "provider_paused:120"
+        assert runtime.provider_paused_until == base_ts + 120
+        notification_service.send_status.assert_awaited_once()
+        assert expected_resume_text in notification_service.send_status.call_args[0][0]

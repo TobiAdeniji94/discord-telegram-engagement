@@ -246,6 +246,10 @@ class TestDiscordGatewayCommands:
         gateway._runtime.xai_requests_made = 3
         gateway._runtime.xai_http_attempts_made = 3
         gateway._runtime.xai_x_search_tool_calls = 2
+        gateway._runtime.provider_paused_until = 1893456000.0
+        gateway._runtime.provider_pause_reason = (
+            "xAI rate limited the bot. Search is paused until the retry window."
+        )
         gateway._runtime.xai_recent_usage_events = [
             {
                 "timestamp": 9999999999.0,
@@ -265,3 +269,4 @@ class TestDiscordGatewayCommands:
         assert "xAI Telemetry" in reply_text
         assert "Configured ceiling" in reply_text
         assert "HTTP RPM" in reply_text
+        assert "2030-01-01T00:00:00Z" in reply_text

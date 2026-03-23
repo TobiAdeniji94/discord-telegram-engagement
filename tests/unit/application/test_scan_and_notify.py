@@ -639,6 +639,7 @@ class TestScanAndNotifyUseCase:
         mock_search_provider,
         mock_notification_service,
         runtime,
+        monkeypatch,
     ):
         """Should pause the provider when twitterapi.io returns 429."""
         mock_config.search_queries = [
@@ -656,13 +657,26 @@ class TestScanAndNotifyUseCase:
                 retry_after_seconds=120,
             )
         )
+        base_ts = 1760000000.0
+        expected_resume_text = (
+            datetime.fromtimestamp(base_ts + 120, tz=timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+        monkeypatch.setattr(
+            "twitter_intel.application.use_cases.scan_and_notify.time.time",
+            lambda: base_ts,
+        )
 
         result = await use_case.execute()
 
         assert result.queued_count == 0
         assert runtime.last_fetch_summary == "provider_paused:120"
-        assert runtime.provider_paused_until > 0
+        assert runtime.provider_paused_until == base_ts + 120
         mock_notification_service.send_status.assert_awaited()
+        assert expected_resume_text in mock_notification_service.send_status.call_args[0][0]
 
     async def test_standard_flow_uses_compiled_query_and_latest_hint(
         self,
