@@ -150,7 +150,7 @@ class TestXaiClient:
                 if len(requested_models) == 1:
                     return httpx.Response(
                         400,
-                        json={"error": {"message": "Invalid model requested"}},
+                        json={"error": {"message": "Request validation failed"}},
                         request=request,
                     )
                 return httpx.Response(200, json={"output_text": "ok"}, request=request)
@@ -173,6 +173,40 @@ class TestXaiClient:
             "grok-4.20-0309-reasoning",
             "grok-4.20-reasoning",
         ]
+
+    @pytest.mark.asyncio
+    async def test_http_status_error_includes_xai_response_body(self):
+        class FakeAsyncClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, path, json):
+                request = httpx.Request("POST", "https://api.x.ai/v1/responses")
+                return httpx.Response(
+                    400,
+                    json={"error": {"message": "Tool x_search is not supported for this model"}},
+                    request=request,
+                )
+
+        client = XaiClient("test_key")
+        with (
+            patch("twitter_intel.infrastructure.search.xai_client.httpx.AsyncClient", FakeAsyncClient),
+            pytest.raises(httpx.HTTPStatusError) as exc_info,
+        ):
+            await client.create_response(
+                model="grok-4.20-reasoning",
+                prompt="hello",
+                tool_config={"type": "x_search"},
+                max_turns=1,
+            )
+
+        assert "Tool x_search is not supported for this model" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_request_error_retries_and_invokes_attempt_callback(self):

@@ -5,6 +5,7 @@ Provides tweet search capabilities using xAI's Grok model with x_search tool.
 """
 
 import asyncio
+import logging
 import random
 import uuid
 from collections.abc import Callable
@@ -15,6 +16,8 @@ from typing import Any
 import httpx
 
 from twitter_intel.exceptions import XaiAuthError, XaiRateLimitError
+
+log = logging.getLogger(__name__)
 
 
 class XaiClient:
@@ -129,20 +132,53 @@ class XaiClient:
     ) -> bool:
         if model != self._primary_default_model or not self._fallback_model:
             return False
-        if response.status_code not in (400, 404):
-            return False
+        return response.status_code in (400, 404)
 
-        body_text = ""
+    @staticmethod
+    def _response_error_detail(
+        response: httpx.Response,
+        *,
+        max_chars: int = 500,
+    ) -> str:
+        detail = ""
         try:
-            parsed = response.json()
-            body_text = str(parsed)
+            payload = response.json()
+            if isinstance(payload, dict):
+                error = payload.get("error")
+                if isinstance(error, dict):
+                    detail = str(
+                        error.get("message")
+                        or error.get("detail")
+                        or error
+                    )
+                elif error is not None:
+                    detail = str(error)
+                else:
+                    detail = str(payload)
+            else:
+                detail = str(payload)
         except Exception:
-            body_text = response.text
+            detail = (response.text or "").strip()
 
-        lowered = body_text.lower()
-        return "model" in lowered and any(
-            marker in lowered
-            for marker in ("invalid", "unsupported", "not found", "unknown", "available")
+        normalized = " ".join(detail.split()).strip()
+        if not normalized:
+            return ""
+        if len(normalized) > max_chars:
+            return normalized[: max_chars - 1] + "…"
+        return normalized
+
+    def _build_http_status_error(self, response: httpx.Response) -> httpx.HTTPStatusError:
+        detail = self._response_error_detail(response)
+        message = (
+            f"Client error '{response.status_code} {response.reason_phrase}' "
+            f"for url '{response.request.url}'"
+        )
+        if detail:
+            message += f" | xAI response: {detail}"
+        return httpx.HTTPStatusError(
+            message,
+            request=response.request,
+            response=response,
         )
 
     async def create_response(
@@ -220,13 +256,26 @@ class XaiClient:
                         )
 
                     if self._should_fallback_model(resp, current_model):
+                        log.warning(
+                            "xAI model '%s' returned %s; retrying with fallback model '%s'%s",
+                            current_model,
+                            resp.status_code,
+                            self._fallback_model,
+                            (
+                                f" ({self._response_error_detail(resp)})"
+                                if self._response_error_detail(resp)
+                                else ""
+                            ),
+                        )
                         break
 
                     if resp.status_code >= 500 and attempt < max_attempts - 1:
                         await asyncio.sleep(self._retry_delay_seconds(attempt))
                         continue
 
-                    resp.raise_for_status()
+                    if resp.is_error:
+                        raise self._build_http_status_error(resp)
+
                     data = resp.json()
 
                     if not isinstance(data, dict):
